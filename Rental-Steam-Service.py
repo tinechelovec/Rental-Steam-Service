@@ -73,7 +73,7 @@ from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 import tg_bot.CBT as CBT
 
 NAME = 'Rental Steam Service'
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 DESCRIPTION = 'чичес'
 CREDITS = '@tinechelovec'
 UUID = 'c496f874-3f3c-4d08-a53a-ae8b94f8de73'
@@ -547,7 +547,7 @@ def _sanitize_cfg(raw):
     raw_providers = cfg.get('providers')
     cfg['providers'] = {}
     for k, v in (raw_providers.items() if isinstance(raw_providers, dict) else []):
-        if k not in {'kosell', 'muvsell'} or not isinstance(v, dict):
+        if k not in {'kosell', 'muvsell', 'tdugame'} or not isinstance(v, dict):
             continue
         entry = dict(v)
         entry['api_key'] = str(entry.get('api_key') or '').strip()
@@ -1053,8 +1053,8 @@ def _steamsmm_request(cfg, method, path, payload=None, retries=1):
         raise last_error
     raise last_error or SteamSMMError('Неизвестная ошибка SteamSMM.')
 
-PROVIDERS = {'steamsmm': 'SteamSMM', 'kosell': 'Kosell', 'muvsell': 'Muvsell'}
-PROVIDER_BASES = {'kosell': 'https://ru.kosell.store/api/v1', 'muvsell': 'https://muvsell.store/api/v1'}
+PROVIDERS = {'steamsmm': 'SteamSMM', 'kosell': 'Kosell', 'muvsell': 'Muvsell', 'tdugame': 'TDUgame'}
+PROVIDER_BASES = {'kosell': 'https://ru.kosell.store/api/v1', 'muvsell': 'https://muvsell.store/api/v1', 'tdugame': 'https://tdugame.ru/api/v1'}
 _PROVIDER_UI = {}
 _OPERATIONS_LOCK = threading.RLock()
 OPERATIONS_FILE = os.path.join(PLUGIN_FOLDER, 'provider_operations.json')
@@ -1139,7 +1139,7 @@ def _external_request(cfg, method, path, payload=None, idem=None):
         detail = detail.get('message') or detail.get('error') or str(detail)
     code = str(body.get('code') or body.get('error') or '') if isinstance(body, dict) else ''
     code = {'no_stock': 'NO_STOCK', 'insufficient_balance': 'INSUFFICIENT_BALANCE',
-            'not_found': 'RENTAL_NOT_FOUND' if '/rental/' in path and path.endswith(('/credentials', '/code')) else 'PRODUCT_NOT_FOUND'}.get(code, code)
+            'not_found': 'RENTAL_NOT_FOUND' if (path.startswith('/rental/') or path.startswith('/rentals/')) else 'PRODUCT_NOT_FOUND'}.get(code, code)
 
     message = str(detail or f'HTTP {response.status_code}').replace(token, '[скрыто]')[:300]
     raise SteamSMMError(f'{PROVIDERS[provider]}: {message}', response.status_code, code,
@@ -1148,7 +1148,12 @@ def _external_request(cfg, method, path, payload=None, idem=None):
 def _external_rental(provider, data):
     raw = data.get('rental', data)
     result = dict(raw)
-    if provider == 'kosell':
+    if provider == 'tdugame':
+        result.update(rental_id=raw.get('rentalUid'), starts_at=raw.get('createdAt'),
+                      ends_at=raw.get('expiresAt'), amount=raw.get('priceRub'))
+        if result.get('status') in ('expired', 'terminated'):
+            result['status'] = 'ended'
+    elif provider == 'kosell':
         result.update(rental_id=raw.get('rental_uid'), starts_at=raw.get('started_at'),
                       ends_at=raw.get('new_expires_at') or raw.get('expires_at'),
                       amount=raw.get('price_rub') if raw.get('price_rub') is not None else raw.get('price_paid'))
@@ -1208,6 +1213,20 @@ def _once_operation(cfg, operation, idem, call, recover=None):
 
 def _external_rent(cfg, product_id, hours, idem):
     provider = _provider_id(cfg)
+    if provider == 'tdugame':
+        raw = _external_request(cfg, 'POST', '/rent',
+            {'productId': int(product_id), 'hours': int(hours), 'quantity': 1}, idem)
+        uids = raw.get('rentalUids') if isinstance(raw, dict) else None
+        if not isinstance(uids, list) or len(uids) != 1 or not _normalize_rental_id(uids[0]) or raw.get('failedCount', 0) != 0:
+            raise SteamSMMError('TDUgame не подтвердил одну аренду. Проверьте заказ у провайдера.', code='PAYMENT_UNCERTAIN')
+        result = {'rental_id': _normalize_rental_id(uids[0]), 'status': 'active', 'amount': raw.get('priceRub')}
+        try:
+            result.update(_external_rental(provider, _external_request(cfg, 'GET', '/rentals/' + _rental_path_id(uids[0]))))
+            result['rental_id'] = _normalize_rental_id(uids[0])
+            result['amount'] = raw.get('priceRub')
+        except SteamSMMError:
+            pass
+        return result
     if provider == 'kosell':
         return _external_rental(provider, _external_request(cfg, 'POST', '/rental/rent',
             {'product_id': int(product_id), 'duration_hours': int(hours), 'currency': 'RUB', 'idempotency_key': str(idem)}, idem))
@@ -1230,6 +1249,12 @@ def _external_rent(cfg, product_id, hours, idem):
 
 def _external_extend(cfg, rental_id, hours, idem):
     provider = _provider_id(cfg)
+    if provider == 'tdugame':
+        raw = _external_request(cfg, 'POST', f'/rentals/{_rental_path_id(rental_id)}/extend',
+                                {'hours': int(hours)}, idem)
+        if not isinstance(raw, dict) or not raw.get('expiresAt'):
+            raise SteamSMMError('TDUgame не подтвердил новый срок аренды.', code='PAYMENT_UNCERTAIN')
+        return {'rental_id': rental_id, 'ends_at': raw['expiresAt'], 'amount': raw.get('priceRub')}
     payload = {'hours': int(hours), 'currency': 'RUB'} if provider == 'kosell' else {'durationKey': f'{int(hours)}h', 'payWith': 'rub'}
     def extend():
         raw = _external_request(cfg, 'POST', f'/rental/{_rental_path_id(rental_id)}/extend', payload)
@@ -1273,11 +1298,6 @@ def _providers_kb():
     kb = K()
     for pid, name in PROVIDERS.items():
         kb.row(B(name, callback_data=CB + ':provider:' + pid))
-    kb.row(
-        B('SteamSMM', url=STEAMSMM_SERVICE_URL),
-        B('Kosell', url=KOSELL_SERVICE_URL),
-        B('Muvsell', url=MUVSELL_SERVICE_URL),
-    )
     kb.add(B('◀️ Назад', callback_data=CB_SETTINGS))
     return kb
 
@@ -1436,7 +1456,7 @@ def _register_provider_callbacks(cardinal):
 def _api_balance(cfg):
     provider = _provider_id(cfg)
     if provider != 'steamsmm':
-        raw = _external_request(cfg, 'GET', '/account/balance')
+        raw = _external_request(cfg, 'GET', '/balance' if provider == 'tdugame' else '/account/balance')
         if not isinstance(raw, dict):
             raise SteamSMMError('Провайдер вернул некорректный баланс.', code='INVALID_RESPONSE')
         nested = raw.get('balances') if isinstance(raw.get('balances'), dict) else {}
@@ -1468,12 +1488,14 @@ def _api_balance(cfg):
 def _api_products(cfg):
     provider = _provider_id(cfg)
     if provider != 'steamsmm':
-        raw = _external_request(cfg, 'GET', '/rental/products')
+        raw = _external_request(cfg, 'GET', '/products' if provider == 'tdugame' else '/rental/products')
         rows = raw if isinstance(raw, list) else raw.get('products', [])
         products = []
         for row in rows:
             if provider == 'kosell':
                 products.append(dict(row, product_id=row['id'], price_per_hour=row['price_per_hour_rub'], stock=row['available_accounts']))
+            elif provider == 'tdugame':
+                products.append(dict(row, product_id=row['id'], price_per_hour=row.get('pricePerHourRub'), stock=row.get('availableAccounts')))
             else:
                 products.append(dict(row, product_id=row['lotId'], game_id=row['id'], price_per_hour=row.get('pricePerHourRub'), stock=row['inStock'] if row.get('available') else 0))
         return {'products': products}
@@ -1481,6 +1503,9 @@ def _api_products(cfg):
 
 def _api_calculate_price(cfg, product_id, hours):
     provider = _provider_id(cfg)
+    if provider == 'tdugame':
+        raw = _external_request(cfg, 'POST', f'/products/{int(product_id)}/quote', {'hours': int(hours), 'quantity': 1})
+        return {'total_cost': raw['priceRub']}
     if provider == 'kosell':
         raw = _external_request(cfg, 'POST', '/rental/calculate-price', {'product_id': int(product_id), 'hours': int(hours)})
         return {'total_cost': raw['total_rub']}
@@ -1519,6 +1544,8 @@ def _api_extend(cfg, rental_id, hours, idempotency_key):
 
 def _api_status(cfg, rental_id):
     provider = _provider_id(cfg)
+    if provider == 'tdugame':
+        return _external_rental(provider, _external_request(cfg, 'GET', f'/rentals/{_rental_path_id(rental_id)}'))
     if provider == 'kosell':
         rows = _external_request(cfg, 'GET', '/rental/active')
         for row in rows:
@@ -1533,7 +1560,8 @@ def _api_status(cfg, rental_id):
 def _api_credentials(cfg, rental_id):
     provider = _provider_id(cfg)
     if provider != 'steamsmm':
-        raw = _external_request(cfg, 'GET', f'/rental/{_rental_path_id(rental_id)}/credentials')
+        prefix = '/rentals' if provider == 'tdugame' else '/rental'
+        raw = _external_request(cfg, 'GET', f'{prefix}/{_rental_path_id(rental_id)}/credentials')
         return _single_account(raw, 'accounts') if provider == 'muvsell' else raw
     rid = _rental_path_id(rental_id)
     return (_steamsmm_request(cfg, 'GET', f'/rentals/{rid}/credentials', retries=2).get('data') or {})
@@ -1541,9 +1569,10 @@ def _api_credentials(cfg, rental_id):
 def _api_guard(cfg, rental_id):
     provider = _provider_id(cfg)
     if provider != 'steamsmm':
-        raw = _external_request(cfg, 'GET', f'/rental/{_rental_path_id(rental_id)}/code')
+        prefix = '/rentals' if provider == 'tdugame' else '/rental'
+        raw = _external_request(cfg, 'GET', f'{prefix}/{_rental_path_id(rental_id)}/code')
         result = _single_account(raw, 'codes') if provider == 'muvsell' else raw
-        if not result.get('code'):
+        if not (result.get('code') or result.get('guard_code')):
             raise SteamSMMError('Steam Guard пока не доступен.', code='GUARD_UNAVAILABLE')
         return result
     rid = _rental_path_id(rental_id)
@@ -4295,6 +4324,7 @@ def _buyer_command_handler(cardinal, event):
             return True
         rec = _select_rental_by_login(chat_id, target, buyer_author, cardinal)
         if not rec:
+            logger.info('Steam Guard: не найдена подтверждённая активная аренда для запроса из чата %s.', chat_id)
             _command_reply(cardinal, event, _tpl(cfg, 'no_active_rental'))
             return True
         rec_cfg = _cfg_for_record(rec, cfg)
@@ -4311,7 +4341,11 @@ def _buyer_command_handler(cardinal, event):
             if not code:
                 raise RuntimeError('Провайдер не вернул Guard-код.')
             _command_reply(cardinal, event, _tpl(rec_cfg, 'guard', code=code, game=rec.get('product_name'), order_id=rec.get('order_id')))
+            logger.info('Steam Guard: ответ обработан для заказа %s, провайдер %s.', rec.get('order_id'), _provider_id(rec_cfg))
         except Exception as e:
+            logger.warning('Steam Guard: ошибка получения для заказа %s, провайдер %s, тип=%s, код=%s.',
+                           rec.get('order_id'), _provider_id(rec_cfg), type(e).__name__,
+                           getattr(e, 'code', '') if isinstance(e, SteamSMMError) else '')
             _command_reply(cardinal, event, _tpl(rec_cfg, 'guard_failed', reason=_buyer_error_message(e)))
         return True
 
@@ -5653,7 +5687,7 @@ def _validate_config_payload(payload):
     elif raw.get('proxy_enabled'):
         raise ValueError('Нельзя включить прокси без адреса.')
     providers = raw.get('providers', {})
-    if not isinstance(providers, dict) or set(providers) - {'kosell', 'muvsell'}:
+    if not isinstance(providers, dict) or set(providers) - {'kosell', 'muvsell', 'tdugame'}:
         raise ValueError('Некорректный раздел провайдеров.')
     for entry in providers.values():
         if not isinstance(entry, dict) or not isinstance(entry.get('api_key', ''), str):
