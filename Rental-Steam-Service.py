@@ -73,7 +73,7 @@ from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 import tg_bot.CBT as CBT
 
 NAME = 'Rental Steam Service'
-VERSION = '1.2.0'
+VERSION = '1.2.1'
 DESCRIPTION = 'чичес'
 CREDITS = '@tinechelovec'
 UUID = 'c496f874-3f3c-4d08-a53a-ae8b94f8de73'
@@ -176,6 +176,12 @@ _MAINT_THREAD_STARTED = False
 _MAINT_STOP = threading.Event()
 _LAST_GUARD = {}
 _LAST_COMMAND_REPLY = {}
+_PAYMENT_REJECTION_LOG = {}
+_PAYMENT_REJECTION_LOG_LOCK = threading.RLock()
+_POST_RENT_SYNC_LOCK = threading.RLock()
+_POST_RENT_SYNC_TS = 0
+_FUNPAY_LOT_RATE_LOCK = threading.RLock()
+_FUNPAY_LOT_RATE_UNTIL = 0.0
 _LAST_AUTO_SYNC = 0
 _LOT_LIST_PAGE = {}
 
@@ -729,7 +735,16 @@ def _cfg_candidates_for_record(record, preferred_cfg=None):
     if fp:
         candidates = [r for r in candidates if r[2] == fp]
     if owner:
-        candidates = [r for r in candidates if r[0] == owner]
+        owned = [r for r in candidates if r[0] == owner]
+        if owned:
+            return owned
+
+
+        if not fp:
+            return []
+        if candidates:
+            logger.info('Заказ #%s: владелец настроек изменился, API-ключ подтверждён по отпечатку.',
+                        record.get('order_id') or '?')
     return candidates
 
 def _claim_rental_owner(record, owner_key, cfg):
@@ -2546,7 +2561,12 @@ def _post_lot_payload(account, payload, referer_lot_id=0):
     method = getattr(account, 'method', None)
     if not callable(method):
         raise RuntimeError('FunPayAPI Account.method недоступен.')
-    response = method('post', 'lots/offerSave', headers, payload, raise_not_200=True)
+    _funpay_lot_rate_guard()
+    try:
+        response = method('post', 'lots/offerSave', headers, payload, raise_not_200=True)
+    except Exception as e:
+        _funpay_lot_observe_error(e)
+        raise
     error = _funpay_save_error(response)
     if error:
         raise RuntimeError(f'FunPay отклонил сохранение лота: {error}')
@@ -2565,15 +2585,47 @@ def _ensure_funpay_account_loaded(account, force=False):
     getter()
     return True
 
+def _funpay_lot_rate_guard():
+    with _FUNPAY_LOT_RATE_LOCK:
+        remaining = int(_FUNPAY_LOT_RATE_UNTIL - time.monotonic())
+    if remaining > 0:
+        raise RuntimeError(f'FunPay лимит запросов к лотам (429), повтор через {remaining} сек.')
+
+def _funpay_lot_observe_error(error):
+    global _FUNPAY_LOT_RATE_UNTIL
+    if re.search(r'(?:\b429\b|too many requests)', str(error or ''), re.I):
+        with _FUNPAY_LOT_RATE_LOCK:
+            before = _FUNPAY_LOT_RATE_UNTIL
+            _FUNPAY_LOT_RATE_UNTIL = max(before, time.monotonic() + 120)
+        if before <= time.monotonic():
+            logger.warning('FunPay ответил 429 · операции с лотами приостановлены на 120 сек.')
+        return True
+    return False
+
+def _funpay_safe_save_lot(save_lot, lot_fields):
+    _funpay_lot_rate_guard()
+    try:
+        return save_lot(lot_fields)
+    except Exception as e:
+        _funpay_lot_observe_error(e)
+        raise
+
 def _get_lot_fields_ready(account, lot_id):
+    _funpay_lot_rate_guard()
     try:
         return account.get_lot_fields(int(lot_id))
     except Exception as e:
+        if _funpay_lot_observe_error(e):
+            raise
         msg = str(e).lower()
         if 'account.get' not in msg and 'данные об аккаунте' not in msg:
             raise
         _ensure_funpay_account_loaded(account, force=True)
-        return account.get_lot_fields(int(lot_id))
+        try:
+            return account.get_lot_fields(int(lot_id))
+        except Exception as second:
+            _funpay_lot_observe_error(second)
+            raise
 
 def _configured_lot_ids():
     ids = set()
@@ -2655,7 +2707,7 @@ def _set_lot_active(cardinal, lot_id, enabled):
             save_lot = getattr(account, 'save_lot', None)
             if not callable(save_lot):
                 raise RuntimeError('Account.save_lot недоступен')
-            save_lot(lf)
+            _funpay_safe_save_lot(save_lot, lf)
 
             if LOT_SAVE_VERIFY_DELAY:
                 time.sleep(LOT_SAVE_VERIFY_DELAY)
@@ -2668,6 +2720,8 @@ def _set_lot_active(cardinal, lot_id, enabled):
         except Exception as e:
             last_error = _compact_error(e)
             logger.warning('LOT %s · %s · %s/%s · %s', lot_id, action, attempt, LOT_SAVE_RETRIES, last_error)
+            if '429' in last_error or 'лимит запросов' in last_error:
+                break
             if attempt < LOT_SAVE_RETRIES:
                 time.sleep(min(0.6 * attempt, 1.2))
     logger.error('LOT %s · %s не выполнено · %s', lot_id, action, last_error or 'неизвестная ошибка')
@@ -2700,7 +2754,7 @@ def _set_lot_price(cardinal, lot_id, price):
             save_lot = getattr(account, 'save_lot', None)
             if not callable(save_lot):
                 raise RuntimeError('Account.save_lot недоступен')
-            save_lot(lf)
+            _funpay_safe_save_lot(save_lot, lf)
             _remember_lot_funpay_price(lot_id, actual_price)
             if calculated < 1.0:
                 logger.info('LOT %s · расчёт %.2f ₽ · FunPay 1.00 ₽', lot_id, calculated)
@@ -2710,6 +2764,8 @@ def _set_lot_price(cardinal, lot_id, price):
         except Exception as e:
             last_error = _compact_error(e)
             logger.warning('LOT %s · цена %.2f ₽ · %s/%s · %s', lot_id, actual_price, attempt, LOT_SAVE_RETRIES, last_error)
+            if '429' in last_error or 'лимит запросов' in last_error:
+                break
             if attempt < LOT_SAVE_RETRIES:
                 time.sleep(min(0.5 * attempt, 1.0))
     raise RuntimeError(last_error or 'FunPay не сохранил цену LOT')
@@ -2783,7 +2839,7 @@ def _set_lot_amount(cardinal, lot_id, amount):
             save_lot = getattr(account, 'save_lot', None)
             if not callable(save_lot):
                 raise RuntimeError('Account.save_lot недоступен')
-            save_lot(lf)
+            _funpay_safe_save_lot(save_lot, lf)
             check = _get_lot_fields_ready(account, lot_id)
             actual = getattr(check, 'amount', None) if check is not None else None
             if actual in (None, ''):
@@ -2796,6 +2852,8 @@ def _set_lot_amount(cardinal, lot_id, amount):
         except Exception as e:
             last_error = _compact_error(e)
             logger.warning('LOT %s · количество %s · %s/%s · %s', lot_id, target, attempt, LOT_SAVE_RETRIES, last_error)
+            if '429' in last_error or 'лимит запросов' in last_error:
+                break
             if attempt < LOT_SAVE_RETRIES:
                 time.sleep(min(0.5 * attempt, 1.0))
     raise RuntimeError(last_error or 'FunPay не сохранил количество LOT')
@@ -3748,26 +3806,43 @@ def _credentials_delivery_worker(cardinal, order_id, max_wait_sec=600):
             rec, data = _credentials_for_record(rec_cfg, rec)
             login, password = _credentials_values(data)
             if login and password:
-                if login:
-                    rec['account_login'] = login
-                rec['credentials_pending'] = False
-                rec['credentials_delivered'] = True
-                rec['credentials_delivered_ts'] = _now()
-                rec['credentials_error'] = ''
-                _rental_save(rec)
+                rec['account_login'] = login
                 target_chat = _paid_order_chat(cardinal, paid_order)
-                if str(rec.get('delivery_chat_id') or '') != str(target_chat or ''):
-                    rec['delivery_chat_id'] = str(target_chat or '')
+                if not target_chat:
+                    last_error = 'Не удалось подтвердить чат покупателя для отправки.'
+                else:
+                    rec['delivery_chat_id'] = str(target_chat)
+                    sent = _safe_send(cardinal, target_chat, _rent_success_message(cfg, rec, data))
+                    if sent is not None and sent is not False:
+                        rec['credentials_pending'] = False
+                        rec['credentials_delivered'] = True
+                        rec['credentials_delivered_ts'] = _now()
+                        rec['credentials_error'] = ''
+                        rec['credentials_next_retry_ts'] = 0
+                        _rental_save(rec)
+                        _notify_admin(
+                            f'🔐 <b>Данные аренды выданы</b>\nЗаказ: <code>{_h(order_id)}</code>\n'
+                            f'Игра: <b>{_h(rec.get("product_name"))}</b>',
+                            cfg=cfg, kind='rental'
+                        )
+                        return True
+                    last_error = 'FunPay не подтвердил отправку данных входа.'
+                    rec['credentials_pending'] = True
+                    rec['credentials_delivered'] = False
+                    rec['credentials_error'] = last_error
+                    rec['credentials_next_retry_ts'] = _now() + 90
                     _rental_save(rec)
-                if target_chat:
-                    _safe_send(cardinal, target_chat, _rent_success_message(cfg, rec, data))
-                _notify_admin(
-                    f'🔐 <b>Данные аренды выданы</b>\nЗаказ: <code>{_h(order_id)}</code>\n'
-                    f'Игра: <b>{_h(rec.get("product_name"))}</b>',
-                    cfg=cfg, kind='rental'
-                )
-                return True
-            last_error = 'Провайдер пока не вернул логин/пароль.'
+                    if not rec.get('credentials_send_error_notified'):
+                        _notify_admin(
+                            f'⚠️ <b>Не удалось доставить данные FunPay</b>\nЗаказ: <code>{_h(order_id)}</code>\n'
+                            'Плагин сохранит аренду и повторит отправку через 90 секунд.',
+                            cfg=cfg, kind='error'
+                        )
+                        rec['credentials_send_error_notified'] = True
+                        _rental_save(rec)
+                    return False
+            if not last_error:
+                last_error = 'Провайдер пока не вернул логин/пароль.'
         except SteamSMMError as e:
             last_error = _safe_api_error_message(e)
             if e.code in {'RENTAL_API_INCONSISTENT', 'RENTAL_NOT_FOUND_ALL_KEYS', 'RENTAL_OWNER_UNKNOWN'}:
@@ -3818,21 +3893,49 @@ def _credentials_delivery_worker(cardinal, order_id, max_wait_sec=600):
 
 def _process_rental_order(cardinal, event, lot, cfg, order_id, chat_id, buyer_username=''):
     verified = _verified_paid_order(cardinal, order_id, expected_buyer=buyer_username)
-    if not verified or str(_paid_order_chat(cardinal, verified) or '') != str(chat_id or ''):
-        logger.warning('Заказ #%s · аренда НЕ запущена: не прошёл контроль оплаты/чата.', order_id)
+    if not verified:
+        _payment_log_once(order_id, 'NO_VERIFIED_PAYMENT',
+                          'Заказ #%s · аренда НЕ запущена: нет подтверждённой оплаты; причина %s.',
+                          level='warning')
         return None
-    confirmed_lot = _lot_by_event(_owner_cfg(chat_id), verified, None, cardinal=cardinal)
-    if (not confirmed_lot or int(confirmed_lot['lot_id']) != int(lot['lot_id'])
-            or not _paid_rental_lot_match(cardinal, verified, lot)):
-        logger.warning('Заказ #%s · аренда НЕ запущена: оплаченный LOT не совпадает с настройками.', order_id)
+    verified_chat = _paid_order_chat(cardinal, verified)
+    if verified_chat in (None, ''):
+        _payment_log_once(order_id, 'CHAT_NOT_FOUND',
+                          'Заказ #%s · аренда НЕ запущена: чат покупателя не установлен (%s).')
         return None
+    if str(verified_chat) != str(chat_id or ''):
+        logger.info('Заказ #%s · чат заказа обновился: %s -> %s', order_id, chat_id, verified_chat)
+        chat_id = verified_chat
+    buyer_username = str(_order_field(verified, 'buyer_username') or buyer_username or '').strip()
     existing = _rental_get(order_id)
-    cfg = _cfg_for_record(existing, cfg) if existing else _provider_cfg(cfg, _provider_id(lot))
-    if existing and existing.get('rental_id') and str(existing.get('status')) in {'active', 'completed', 'ended'}:
+    if existing and existing.get('rental_id'):
+
+
+        if _as_int(existing.get('lot_id'), 0) != _as_int(lot.get('lot_id'), 0):
+            logger.warning('Заказ #%s · LOT сохранённой аренды не совпадает с текущим.', order_id)
+            return None
         existing = _remember_rental_contact(order_id, chat_id, buyer_username) or existing
-        if str(existing.get('status')) in {'active', 'completed'} and not existing.get('credentials_delivered'):
+        if str(existing.get('status')) in {'active', 'completed', 'retry', 'creating'} and not existing.get('credentials_delivered'):
             _schedule(f'credentials:{order_id}', _credentials_delivery_worker, cardinal, order_id)
         return existing
+    trusted_purchase = (_event_text(event) if event is not None and _system_purchase_message(event)
+                        and (m := _PAID_ORDER_RE.search(_event_text(event)))
+                        and m.group(1).upper() == str(order_id).upper() else '')
+
+
+
+    prior_verified = bool(existing and existing.get('lot_id') == lot.get('lot_id')
+                          and existing.get('order_id') == str(order_id)
+                          and existing.get('lot_paid_verified')
+                          and existing.get('idempotency_key') == _idem('rent', order_id))
+    if not prior_verified:
+        confirmed_lot = _lot_by_event(_owner_cfg(chat_id), verified, event if trusted_purchase else None,
+                                      cardinal=cardinal, extra_text=trusted_purchase)
+        if (not confirmed_lot or int(confirmed_lot['lot_id']) != int(lot['lot_id'])
+                or not _paid_rental_lot_match(cardinal, verified, lot, trusted_purchase)):
+            logger.warning('Заказ #%s · аренда НЕ запущена: оплаченный LOT не совпадает с настройками.', order_id)
+            return None
+    cfg = _cfg_for_record(existing, cfg) if existing else _provider_cfg(cfg, _provider_id(lot))
     aliases = []
     if chat_id not in (None, ''):
         aliases.append(str(chat_id))
@@ -3862,6 +3965,7 @@ def _process_rental_order(cardinal, event, lot, cfg, order_id, chat_id, buyer_us
         record['chat_aliases'] = sorted(_record_chat_aliases(record) | {str(chat_id)})
     if buyer_username:
         record['buyer_username'] = str(buyer_username).strip()
+    record['lot_paid_verified'] = True
     record['attempts'] = _as_int(record.get('attempts'), 0) + 1
     record['status'] = 'creating'
     _rental_save(record)
@@ -3906,18 +4010,40 @@ def _process_rental_order(cardinal, event, lot, cfg, order_id, chat_id, buyer_us
         if login:
             record['account_login'] = login
         if login and password:
-            record['credentials_pending'] = False
-            record['credentials_delivered'] = True
-            record['credentials_delivered_ts'] = _now()
+            record['credentials_pending'] = True
+            record['credentials_delivered'] = False
             record['credentials_error'] = ''
             _rental_save(record)
-            _safe_send(cardinal, record.get('delivery_chat_id') or chat_id, _rent_success_message(cfg, record, credentials))
+
+            still_paid = _verified_paid_order(cardinal, order_id, expected_buyer=buyer_username)
+            delivery_chat = _paid_order_chat(cardinal, still_paid) if still_paid else None
+            sent = (_safe_send(cardinal, delivery_chat, _rent_success_message(cfg, record, credentials))
+                    if delivery_chat else None)
+            if sent is not None and sent is not False:
+                record['delivery_chat_id'] = str(delivery_chat)
+                record['credentials_pending'] = False
+                record['credentials_delivered'] = True
+                record['credentials_delivered_ts'] = _now()
+                record['credentials_next_retry_ts'] = 0
+                _rental_save(record)
+            else:
+                record['credentials_error'] = ('FunPay не подтвердил отправку данных входа.' if still_paid
+                                               else 'Отправка отложена: платёж FunPay не подтверждён.')
+                record['credentials_next_retry_ts'] = _now() + 90
+                _rental_save(record)
+                if still_paid:
+                    _schedule(f'credentials:{order_id}', _credentials_delivery_worker, cardinal, order_id)
+                _notify_admin(
+                    f'⚠️ <b>Не удалось доставить данные FunPay</b>\nЗаказ: <code>{_h(order_id)}</code>\n'
+                    f'Причина: <code>{_h(record["credentials_error"])}</code>',
+                    cfg=cfg, kind='error'
+                )
         else:
             record['credentials_pending'] = True
             record['credentials_error'] = credentials_error or 'Провайдер пока не вернул логин/пароль.'
             _rental_save(record)
             if not record.get('credentials_pending_notified'):
-                _safe_send(cardinal, record.get('delivery_chat_id') or chat_id, _tpl(
+                notice = _safe_send(cardinal, record.get('delivery_chat_id') or chat_id, _tpl(
                     cfg, 'credentials_pending',
                     game=record.get('product_name') or f"Product {record.get('product_id')}",
                     credentials_command=f'!данные_{record.get("order_id")}',
@@ -3925,9 +4051,9 @@ def _process_rental_order(cardinal, event, lot, cfg, order_id, chat_id, buyer_us
                     extend_command=f'!продлить_{record.get("order_id")}',
                     order_id=record.get('order_id'), rental_id=rental_id
                 ))
-                record['credentials_pending_notified'] = True
-                _rental_save(record)
-
+                if notice is not None and notice is not False:
+                    record['credentials_pending_notified'] = True
+                    _rental_save(record)
             _schedule(f'credentials:{order_id}', _credentials_delivery_worker, cardinal, order_id)
         _notify_admin(
             f'✅ <b>Аренда создана</b>\nЗаказ: <code>{_h(order_id)}</code>\n'
@@ -3936,7 +4062,7 @@ def _process_rental_order(cardinal, event, lot, cfg, order_id, chat_id, buyer_us
             cfg=cfg, kind='rental'
         )
 
-        _schedule(f'post-rent-sync:{order_id}', _sync_all, cardinal, True)
+        _schedule_post_rent_sync(cardinal)
         return record
     except SteamSMMError as e:
         code = e.code
@@ -4160,21 +4286,19 @@ def _select_rental_by_order(chat_id, order_hint, author='', cardinal=None):
         return None
     rec = _rental_get(clean)
     if not rec:
+        logger.info('Команда для заказа #%s: запись отсутствует в rentals.json.', clean)
         return None
-
+    if cardinal is not None and not _paid_rental_access(cardinal, rec, chat_id, author):
+        return None
+    if not _record_belongs_to_buyer(rec, chat_id, author):
+        if cardinal is None:
+            return None
+        rec = _repair_rental_contact(cardinal, rec, preferred_chat_id=chat_id) or rec
+        if not _record_belongs_to_buyer(rec, chat_id, author):
+            return None
     cfg = _cfg_for_record(rec, _owner_cfg(rec.get('owner_key') or rec.get('chat_id') or chat_id))
     rec = _refresh_rental_current(cfg, rec)
     if not rec:
-        return None
-    if not _record_belongs_to_buyer(rec, chat_id, author):
-        if cardinal is not None:
-            full = _resolve_full_order(cardinal, clean, None)
-            buyer = _norm_username(_order_field(full, 'buyer_username'))
-            if buyer and buyer == _norm_username(author):
-                rec = _repair_rental_contact(cardinal, rec, preferred_chat_id=chat_id) or rec
-        if not _record_belongs_to_buyer(rec, chat_id, author):
-            return None
-    if cardinal is not None and not _paid_rental_access(cardinal, rec, chat_id):
         return None
     _remember_rental_contact(rec.get('order_id'), chat_id, author)
     return rec
@@ -4184,29 +4308,27 @@ def _select_rental_by_login(chat_id, login_hint, author='', cardinal=None):
     if not clean:
         return None
     for rec in _rental_list(active_only=False):
-        if not rec.get('rental_id'):
+        if not rec.get('rental_id') or not _record_locally_current(rec):
             continue
         saved_login = str(rec.get('account_login') or '').strip()
-        if saved_login and saved_login.lower() != clean.lower():
+        if saved_login and saved_login.casefold() != clean.casefold():
             continue
-        cfg = _cfg_for_record(rec, _owner_cfg(rec.get('owner_key') or rec.get('chat_id') or chat_id))
 
+        if cardinal is not None and not _paid_rental_access(cardinal, rec, chat_id, author):
+            continue
+        if not _record_belongs_to_buyer(rec, chat_id, author):
+            if cardinal is None:
+                continue
+            rec = _repair_rental_contact(cardinal, rec, preferred_chat_id=chat_id) or rec
+            if not _record_belongs_to_buyer(rec, chat_id, author):
+                continue
+        cfg = _cfg_for_record(rec, _owner_cfg(rec.get('owner_key') or rec.get('chat_id') or chat_id))
         rec_cfg = _cfg_for_record(rec, cfg)
         rec = _refresh_rental_current(rec_cfg, rec)
         if not rec:
             continue
-        login = saved_login or _ensure_record_login(cfg, rec)
-        if not login or login.lower() != clean.lower():
-            continue
-        if not _record_belongs_to_buyer(rec, chat_id, author):
-            if cardinal is not None:
-                full = _resolve_full_order(cardinal, rec.get('order_id'), None)
-                buyer = _norm_username(_order_field(full, 'buyer_username'))
-                if buyer and buyer == _norm_username(author):
-                    rec = _repair_rental_contact(cardinal, rec, preferred_chat_id=chat_id) or rec
-            if not _record_belongs_to_buyer(rec, chat_id, author):
-                continue
-        if cardinal is not None and not _paid_rental_access(cardinal, rec, chat_id):
+        login = saved_login or _ensure_record_login(rec_cfg, rec)
+        if not login or login.casefold() != clean.casefold():
             continue
         _remember_rental_contact(rec.get('order_id'), chat_id, author)
         return rec
@@ -4324,7 +4446,7 @@ def _buyer_command_handler(cardinal, event):
             return True
         rec = _select_rental_by_login(chat_id, target, buyer_author, cardinal)
         if not rec:
-            logger.info('Steam Guard: не найдена подтверждённая активная аренда для запроса из чата %s.', chat_id)
+            logger.info('Steam Guard: не найдена оплаченная активная аренда login=%s chat=%s.', target, chat_id)
             _command_reply(cardinal, event, _tpl(cfg, 'no_active_rental'))
             return True
         rec_cfg = _cfg_for_record(rec, cfg)
@@ -4494,6 +4616,9 @@ def _apply_lot_sync(cardinal, owner_key, cfg, products_data=None, balance_data=N
     lot_notes = []
     balance_blocked = False
     for row in lots:
+        if _FUNPAY_LOT_RATE_UNTIL > time.monotonic():
+            notes.append('FunPay 429: обновление оставшихся лотов отложено до снятия ограничения')
+            break
         lot_id = int(row['lot_id'])
         prev_stock = row.get('last_stock')
         prev_api_cost = _as_float(row.get('last_api_cost'), 0.0)
@@ -4650,6 +4775,19 @@ def _sync_all(cardinal, notify=False):
                 _provider_sync_save(owner, cfg, lots=cfg['lots'])
     return result
 
+def _schedule_post_rent_sync(cardinal):
+    global _POST_RENT_SYNC_TS
+    with _POST_RENT_SYNC_LOCK:
+        now = time.monotonic()
+        if now - _POST_RENT_SYNC_TS < 90:
+            return False
+        if _FUNPAY_LOT_RATE_UNTIL > now:
+            return False
+        if _schedule('post-rent-sync', _sync_all, cardinal, True):
+            _POST_RENT_SYNC_TS = now
+            return True
+        return False
+
 def _retry_pending(cardinal):
     now = _now()
     cfg = _owner_cfg()
@@ -4664,7 +4802,7 @@ def _retry_pending(cardinal):
         if not lot:
             continue
         fake_event = None
-        _schedule(f'retry-rent:{rec["order_id"]}', _process_rental_order, cardinal, fake_event, lot, cfg, rec['order_id'], rec.get('chat_id'))
+        _schedule(f'rent-order:{rec["order_id"]}', _process_rental_order, cardinal, fake_event, lot, cfg, rec['order_id'], rec.get('chat_id'))
     for ext in _extension_records().values():
         if ext.get('status') == 'retry' and int(ext.get('next_retry_ts') or 0) <= now and ext.get('purchase_order_id'):
             _schedule(
@@ -6826,10 +6964,45 @@ def init_cardinal(cardinal):
     except Exception:
         pass
     logger.info('Rental Steam Service v%s запущен.', VERSION)
+_PAYMENT_TERMINAL_STATUSES = {'REFUNDED', 'PARTIALLY_REFUNDED', '2', '3', 'CANCELLED', 'CANCELED', 'CHARGEBACK', 'REVERSED'}
+
+def _payment_status_name(order):
+    raw = _order_field(order, 'status')
+    named = getattr(raw, 'name', raw)
+    return str(named if named is not None else '').strip().upper().split('.')[-1]
+
+def _payment_log_once(order_id, status, message, level='warning', interval=300):
+    key = (str(order_id), str(status))
+    with _PAYMENT_REJECTION_LOG_LOCK:
+        now = _now()
+        if now - _PAYMENT_REJECTION_LOG.get(key, 0) < interval:
+            return False
+        _PAYMENT_REJECTION_LOG[key] = now
+        if len(_PAYMENT_REJECTION_LOG) > 2000:
+            for old_key, old_time in list(_PAYMENT_REJECTION_LOG.items()):
+                if now - old_time > 3600:
+                    _PAYMENT_REJECTION_LOG.pop(old_key, None)
+    getattr(logger, level)(message, order_id, status)
+    return True
+
+def _mark_refunded_order(order_id, status):
+    if status not in _PAYMENT_TERMINAL_STATUSES:
+        return
+    rec = _rental_get(order_id)
+    if not rec:
+        return
+    if rec.get('payment_blocked') and (rec.get('rental_id') or rec.get('status') == 'refunded'):
+        return
+    rec['payment_blocked'] = True
+    rec['payment_status'] = status
+    if not rec.get('rental_id'):
+
+        rec['status'] = 'refunded'
+        rec['next_retry_ts'] = 0
+    _rental_save(rec)
+
 def _paid_status_verified(order):
-    status = _order_field(order, 'status')
-    name = str(getattr(status, 'name', status) or '').strip().upper().split('.')[-1]
-    return name in {'PAID', 'CLOSED', '0', '1'}
+    return _payment_status_name(order) in {'PAID', 'CLOSED', '0', '1'}
 
 def _verified_paid_order(cardinal, oid, expected_buyer=''):
     account = getattr(cardinal, 'account', None)
@@ -6844,8 +7017,10 @@ def _verified_paid_order(cardinal, oid, expected_buyer=''):
         logger.warning('Заказ #%s · FunPay не подтвердил идентификатор заказа.', oid)
         return None
     if not _paid_status_verified(full):
-        logger.info('Заказ #%s · автовыдача заблокирована: статус FunPay %s.', oid,
-                    _order_field(full, 'status'))
+        status = _payment_status_name(full)
+        _mark_refunded_order(oid, status)
+        _payment_log_once(oid, status, 'Заказ #%s · автовыдача заблокирована: статус FunPay %s.',
+                          level='warning' if status in _PAYMENT_TERMINAL_STATUSES else 'info')
         return None
     seller_id = _order_field(full, 'seller_id')
     our_id = _order_field(account, 'id')
@@ -6862,15 +7037,37 @@ def _verified_paid_order(cardinal, oid, expected_buyer=''):
         return None
     return full
 
-def _paid_rental_access(cardinal, rec, chat_id=None):
+def _paid_rental_access(cardinal, rec, chat_id=None, author=''):
     full = _verified_paid_order(cardinal, str((rec or {}).get('order_id') or ''),
                                 expected_buyer=(rec or {}).get('buyer_username') or '')
     if full is None:
         return False
+    if chat_id is None:
+        return True
+    chat_id = str(chat_id)
     paid_chat = _paid_order_chat(cardinal, full)
-    if chat_id is not None and str(paid_chat or '') != str(chat_id):
+    if paid_chat not in (None, '') and chat_id == str(paid_chat):
+        return True
+    buyer = _norm_username(_order_field(full, 'buyer_username'))
+    if not buyer or buyer != _norm_username(author):
+        logger.info('Заказ #%s · доступ отклонён: чат %s не совпал с оплаченным чатом.',
+                    (rec or {}).get('order_id'), chat_id)
         return False
-    return True
+
+
+    if chat_id in _record_chat_aliases(rec or {}):
+        return True
+    finder = getattr(getattr(cardinal, 'account', None), 'get_chat_by_name', None)
+    if callable(finder):
+        try:
+            buyer_chat = finder(buyer, True)
+            if str(_order_field(buyer_chat, 'id') or '') == chat_id:
+                return True
+        except Exception:
+            pass
+    logger.info('Заказ #%s · доступ отклонён: не удалось подтвердить новый чат покупателя.',
+                (rec or {}).get('order_id'))
+    return False
 
 def _paid_order_chat(cardinal, order):
     chat_id = _order_field(order, 'chat_id')
@@ -6898,7 +7095,7 @@ def _system_purchase_message(event):
         return False
     return True
 
-_PAID_ORDER_RE = re.compile(r'(?:оплатил|оплатила)\s+заказ\s*#([A-Za-z0-9]+)', re.I)
+_PAID_ORDER_RE = re.compile(r'(?:оплатил|оплатила)\s+заказ\s*#([A-Za-z0-9_-]+)', re.I)
 
 def _dispatch_paid_order(cardinal, event, order, oid, chat_id=None, source='event', extra_text=''):
     cfg = _owner_cfg(chat_id)
@@ -6908,7 +7105,9 @@ def _dispatch_paid_order(cardinal, event, order, oid, chat_id=None, source='even
     expected_buyer = _order_field(order, 'buyer_username') if source == 'new_order' else ''
     full_order = _verified_paid_order(cardinal, oid, expected_buyer=expected_buyer)
     if full_order is None:
-        logger.warning('Заказ #%s · пропущен: нет подтверждённого оплаченного заказа FunPay (%s).', oid, source)
+        _payment_log_once(oid, 'DISPATCH_UNVERIFIED',
+                          'Заказ #%s · пропущен: нет подтверждённого оплаченного заказа FunPay (%s).',
+                          level='info')
         return False
     target_chat = _paid_order_chat(cardinal, full_order)
     if not target_chat:
@@ -6942,14 +7141,18 @@ def _dispatch_paid_order(cardinal, event, order, oid, chat_id=None, source='even
                   cardinal, event, ext, oid, target_chat)
         return True
 
-    lot = _lot_by_event(cfg, full_order, None, cardinal=cardinal)
-    if lot is None or not _paid_rental_lot_match(cardinal, full_order, lot):
+    trusted_purchase = (_event_text(event) if source == 'paid_message' and _system_purchase_message(event)
+                        and (m := _PAID_ORDER_RE.search(_event_text(event)))
+                        and m.group(1).upper() == str(oid).upper() else '')
+    lot = _lot_by_event(cfg, full_order, event if trusted_purchase else None,
+                        cardinal=cardinal, extra_text=trusted_purchase)
+    if lot is None or not _paid_rental_lot_match(cardinal, full_order, lot, trusted_purchase):
         logger.info('Заказ #%s · настроенный Rental LOT не подтверждён из заказа FunPay · ids=%s · text=%s',
                     oid, sorted(authoritative_ids), _compact_error(authoritative_text, 180))
         return False
     buyer_username = str(_order_field(full_order, 'buyer_username') or '').strip()
     existing = _rental_get(oid)
-    if existing and existing.get('rental_id') and existing.get('status') in {'active', 'completed', 'ended'}:
+    if existing and existing.get('rental_id'):
         _remember_rental_contact(oid, target_chat, buyer_username)
         if existing.get('status') in {'active', 'completed'} and not existing.get('credentials_delivered'):
             _schedule(f'credentials:{oid}', _credentials_delivery_worker, cardinal, oid)
@@ -6967,7 +7170,7 @@ def _dispatch_paid_order(cardinal, event, order, oid, chat_id=None, source='even
     _schedule(f'rent-order:{oid}', _process_rental_order, cardinal, event, lot, cfg, oid, target_chat, buyer_username)
     return True
 
-def _paid_rental_lot_match(cardinal, order, lot):
+def _paid_rental_lot_match(cardinal, order, lot, trusted_purchase_text=''):
     lot_id = _as_int((lot or {}).get('lot_id'), 0, 1)
     if not lot_id:
         return False
@@ -6975,14 +7178,40 @@ def _paid_rental_lot_match(cardinal, order, lot):
     if ids:
         return lot_id in ids
     product = _normalize_order_text((lot or {}).get('product_name'))
+    trusted_text = _normalize_order_text(trusted_purchase_text)
     texts = ' | '.join(_normalize_order_text(x) for x in _order_text_candidates(order))
-    if not product or len(product) < 3 or product not in texts:
+    combined = (texts + ' ' + trusted_text).strip()
+    if not product or len(product) < 3 or product not in combined:
         return False
     prices = _order_price_candidates(order)
     actual = _get_lot_price(cardinal, lot_id) if cardinal is not None else None
     if not actual or actual <= 0:
         actual = _as_float(lot.get('last_funpay_price'), 0.0)
-    return bool(actual and any(abs(float(actual) - p) <= 0.02 for p in prices))
+    if actual and any(abs(float(actual) - p) <= 0.02 for p in prices):
+        return True
+    if not trusted_text:
+        return False
+    if _has_unmanaged_product_collision(cardinal, lot, product):
+        return False
+
+
+
+    offer_texts = _funpay_lot_text(cardinal, lot_id) if cardinal is not None else []
+    titles = [_normalize_order_text(x) for x in offer_texts]
+    titles = [x for x in titles if len(x) >= 15 and x != product and x in trusted_text]
+    if not titles:
+        return False
+    owner_cfg = _owner_cfg()
+    for other in (owner_cfg.get('lots') or []):
+        if _as_int(other.get('lot_id'), 0) == lot_id:
+            continue
+        if _normalize_order_text(other.get('product_name')) != product:
+            continue
+        if any(_normalize_order_text(x) in trusted_text and len(_normalize_order_text(x)) >= 15
+               for x in _funpay_lot_text(cardinal, int(other['lot_id']))):
+            return False
+    logger.info('LOT %s подтверждён по точному названию из системной покупки (цена могла измениться).', lot_id)
+    return True
 
 def _paid_extension_match(order, ext):
     ids = set(_order_lot_ids(order)) | _candidate_ids_from_html(order)
