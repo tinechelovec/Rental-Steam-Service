@@ -68,12 +68,13 @@ _ensure_pip_dependency('bs4', 'beautifulsoup4>=4.12,<5')
 _ensure_pip_dependency('telebot', 'pyTelegramBotAPI>=4.14,<5')
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
 import tg_bot.CBT as CBT
 
 NAME = 'Rental Steam Service'
-VERSION = '1.2.1'
+VERSION = '1.2.2'
 DESCRIPTION = 'чичес'
 CREDITS = '@tinechelovec'
 UUID = 'c496f874-3f3c-4d08-a53a-ae8b94f8de73'
@@ -175,9 +176,22 @@ _CARDINAL_REF = None
 _MAINT_THREAD_STARTED = False
 _MAINT_STOP = threading.Event()
 _LAST_GUARD = {}
+_LAST_GUARD_LOCK = threading.RLock()
+_GUARD_RENTAL_LOCKS = {}
 _LAST_COMMAND_REPLY = {}
 _PAYMENT_REJECTION_LOG = {}
 _PAYMENT_REJECTION_LOG_LOCK = threading.RLock()
+_VERIFIED_ORDER_CACHE = {}
+_VERIFIED_ORDER_CACHE_LOCK = threading.RLock()
+_LOT_FIELDS_CACHE = {}
+_LOT_FIELDS_CACHE_LOCK = threading.RLock()
+_LOT_FIELDS_CACHE_TTL = 1200
+_SEEN_MESSAGES = {}
+_SEEN_MESSAGES_LOCK = threading.RLock()
+_CMD_EXECUTOR = None
+_CMD_EXECUTOR_LOCK = threading.RLock()
+_TG_NOTIFY_EXECUTOR = None
+_TG_NOTIFY_EXECUTOR_LOCK = threading.RLock()
 _POST_RENT_SYNC_LOCK = threading.RLock()
 _POST_RENT_SYNC_TS = 0
 _FUNPAY_LOT_RATE_LOCK = threading.RLock()
@@ -383,12 +397,30 @@ def _atomic_json(path, data, backup=None):
             shutil.copy2(path, backup)
         except Exception:
             pass
-    tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    tmp = f'{path}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:6]}.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        last_err = None
+        for delay in (0.05, 0.1, 0.2, 0.4, 0.8, 0.0):
+            try:
+                os.replace(tmp, path)
+                last_err = None
+                break
+            except PermissionError as exc:
+                last_err = exc
+                if delay > 0:
+                    time.sleep(delay)
+        if last_err is not None:
+            raise last_err
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
 
 def _load_json(path, default, backup=None):
     for candidate in (path, backup):
@@ -739,7 +771,6 @@ def _cfg_candidates_for_record(record, preferred_cfg=None):
         if owned:
             return owned
 
-
         if not fp:
             return []
         if candidates:
@@ -928,6 +959,12 @@ def _buyer_error_message(error):
         'INSUFFICIENT_BALANCE': 'Аренда временно недоступна. Попробуйте позже.',
         'PRODUCT_NOT_FOUND': 'Товар временно недоступен.',
         'RENTAL_NOT_FOUND': 'Аренда не найдена или уже завершена.',
+        'RENTAL_ENDED': 'Срок этой аренды уже закончился.',
+        'CREDENTIALS_UNAVAILABLE': 'Доступ к аренде завершён или временно недоступен.',
+        'GUARD_UNAVAILABLE': 'Код Steam Guard сейчас недоступен. Попробуйте через 10–15 сек.',
+        'NO_GUARD': 'У этого аккаунта нет Steam Guard — входите только по логину и паролю.',
+        'INVALID_GUARD': 'Не удалось сгенерировать код Steam Guard. Напишите продавцу.',
+        'RATE_LIMITED': 'Слишком частые запросы. Подождите 15–30 сек. и повторите.',
         'NETWORK_ERROR': 'Сервис временно не отвечает. Попробуйте позже.',
         'INVALID_RESPONSE': 'Сервис временно не отвечает. Попробуйте позже.',
         'NO_API_KEY': 'Автовыдача временно недоступна.',
@@ -1055,6 +1092,8 @@ def _steamsmm_request(cfg, method, path, payload=None, retries=1):
         if response.status_code in (200, 201) and isinstance(body, dict) and body.get('status') == 'success':
             return body
         code = body.get('code') if isinstance(body, dict) else None
+        if not code and response.status_code == 429:
+            code = 'RATE_LIMITED'
         message = body.get('message') if isinstance(body, dict) else None
         if not message:
             message = (response.text or f'HTTP {response.status_code}')[:500]
@@ -1070,6 +1109,28 @@ def _steamsmm_request(cfg, method, path, payload=None, retries=1):
 
 PROVIDERS = {'steamsmm': 'SteamSMM', 'kosell': 'Kosell', 'muvsell': 'Muvsell', 'tdugame': 'TDUgame'}
 PROVIDER_BASES = {'kosell': 'https://ru.kosell.store/api/v1', 'muvsell': 'https://muvsell.store/api/v1', 'tdugame': 'https://tdugame.ru/api/v1'}
+KOSELL_HOSTS = ('https://ru.kosell.store', 'https://www.kosell.store')
+_KOSELL_HOST_LOCK = threading.RLock()
+_KOSELL_HOST_IDX = 0
+MUVSELL_SITE = 'https://muvsell.store'
+MUVSELL_MIRROR = 'https://cold-band-9582.manimanimanimani4444.workers.dev'
+MUVSELL_API_RATE = 150
+MUVSELL_API_BG_RATE = 100
+MUVSELL_API_COOL_SEC = 30
+MUVSELL_ROUTE_DOWN_SEC = 600
+MUVSELL_QUOTE_BATCH = 50
+MUVSELL_MAX_HOURS = 720
+MUVSELL_URGENT_WAITS = (10, 20, 30)
+_DIRECT_PROXIES = {'http': None, 'https': None}
+_MUVSELL_ROUTE_LOCK = threading.RLock()
+_MUVSELL_ROUTE_DOWN = {}
+_MUVSELL_RATE_LOCK = threading.Lock()
+_MUVSELL_HITS = []
+_MUVSELL_COOL_UNTIL = 0.0
+_PROVIDER_PRODUCTS_CACHE = {}
+_PROVIDER_PRODUCTS_CACHE_LOCK = threading.RLock()
+_MUVSELL_QUOTE_CACHE = {}
+_MUVSELL_QUOTE_CACHE_LOCK = threading.RLock()
 _PROVIDER_UI = {}
 _OPERATIONS_LOCK = threading.RLock()
 OPERATIONS_FILE = os.path.join(PLUGIN_FOLDER, 'provider_operations.json')
@@ -1126,42 +1187,277 @@ def _provider_sync_save(owner, cfg, **updates):
         _set_cfg(owner, lots=merged)
         _provider_save(owner, _provider_id(cfg), **updates)
 
-def _external_request(cfg, method, path, payload=None, idem=None):
+def _request_unsent(exc):
+    reason = getattr(exc.args[0], 'reason', None) if getattr(exc, 'args', None) else None
+    return (
+        isinstance(exc, (requests.exceptions.ConnectTimeout, requests.exceptions.ProxyError))
+        or isinstance(reason, urllib3.exceptions.NewConnectionError)
+    )
+
+def _muvsell_api_slot(urgent=False):
+    cap = MUVSELL_API_RATE - 10 if urgent else MUVSELL_API_BG_RATE
+    deadline = time.time() + 65
+    while True:
+        with _MUVSELL_RATE_LOCK:
+            now = time.time()
+            while _MUVSELL_HITS and now - _MUVSELL_HITS[0] >= 60:
+                _MUVSELL_HITS.pop(0)
+            wait = 0.0 if urgent else _MUVSELL_COOL_UNTIL - now
+            if wait <= 0 and len(_MUVSELL_HITS) < cap:
+                _MUVSELL_HITS.append(now)
+                return
+            if wait <= 0:
+                wait = 60.0 - (now - _MUVSELL_HITS[-cap]) + 0.05
+        if _MAINT_STOP.is_set() or time.time() >= deadline:
+            return
+        time.sleep(min(max(wait, 0.05), 5.0))
+
+def _muvsell_send_routes(method, path, headers, payload, proxies, repeatable, timeout):
+    direct_url = MUVSELL_SITE + '/api/v1' + path
+    mirror_url = MUVSELL_MIRROR + '/api/v1' + path
+    routes = []
+    if proxies:
+        routes.append(('px', direct_url, proxies))
+    routes.append(('direct', direct_url, _DIRECT_PROXIES))
+    if MUVSELL_MIRROR:
+        routes.append(('mirror', mirror_url, _DIRECT_PROXIES))
+    now = time.time()
+    with _MUVSELL_ROUTE_LOCK:
+        live = [r for r in routes if now >= _MUVSELL_ROUTE_DOWN.get(r[0], 0)] or routes
+    for i, (rname, url, rproxies) in enumerate(live):
+        try:
+            return _HTTP.request(method, url, headers=headers, json=payload, timeout=timeout, proxies=rproxies)
+        except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout, requests.exceptions.SSLError) as exc:
+            if i == len(live) - 1 or not (repeatable or _request_unsent(exc)):
+                raise
+            if method != 'GET' and isinstance(exc, requests.exceptions.ReadTimeout):
+                logger.warning('Muvsell: маршрут %s не ответил вовремя, пробую %s', rname, live[i + 1][0])
+                continue
+            with _MUVSELL_ROUTE_LOCK:
+                _MUVSELL_ROUTE_DOWN[rname] = time.time() + MUVSELL_ROUTE_DOWN_SEC
+            logger.warning('Muvsell: маршрут %s недоступен, переключаюсь на %s', rname, live[i + 1][0])
+    raise requests.exceptions.ConnectionError('Muvsell routes exhausted')
+
+def _kosell_hosts_order():
+    with _KOSELL_HOST_LOCK:
+        idx = _KOSELL_HOST_IDX % len(KOSELL_HOSTS)
+    return [KOSELL_HOSTS[(idx + i) % len(KOSELL_HOSTS)] for i in range(len(KOSELL_HOSTS))]
+
+def _kosell_rotate_host():
+    global _KOSELL_HOST_IDX
+    with _KOSELL_HOST_LOCK:
+        _KOSELL_HOST_IDX = (_KOSELL_HOST_IDX + 1) % len(KOSELL_HOSTS)
+        return KOSELL_HOSTS[_KOSELL_HOST_IDX]
+
+def _external_error_details(provider, path, status_code, body, token):
+    detail = ''
+    code = ''
+    if isinstance(body, dict):
+        raw_detail = body.get('detail')
+        if isinstance(raw_detail, dict):
+            code = str(raw_detail.get('error') or raw_detail.get('code') or '')
+            detail = raw_detail.get('message') or raw_detail.get('error') or ''
+        elif isinstance(raw_detail, str) and raw_detail:
+            detail = raw_detail
+        if not detail:
+            detail = body.get('message') or body.get('error') or ''
+        if not code:
+            code = str(body.get('code') or body.get('error') or '')
+    code_norm = str(code or '').strip().lower()
+    if status_code == 402 and not code_norm:
+        code_norm = 'insufficient_balance'
+    elif status_code == 429 and not code_norm:
+        code_norm = 'rate_limited'
+    elif status_code == 404 and not code_norm:
+        code_norm = 'not_found'
+    mapped = {
+        'no_stock': 'NO_STOCK',
+        'insufficient_balance': 'INSUFFICIENT_BALANCE',
+        'no_guard': 'NO_GUARD',
+        'invalid_guard': 'INVALID_GUARD',
+        'rate_limited': 'RATE_LIMITED',
+        'not_found': 'RENTAL_NOT_FOUND' if (path.startswith('/rental/') or path.startswith('/rentals/')) else 'PRODUCT_NOT_FOUND',
+    }.get(code_norm, code.upper() if code else '')
+    message = str(detail or f'HTTP {status_code}').replace(token, '[скрыто]')[:300]
+    return mapped, message
+
+def _external_request(cfg, method, path, payload=None, idem=None, params=None, idempotent=None, urgent=None):
+    global _MUVSELL_COOL_UNTIL
     provider = _provider_id(cfg)
     token = str(cfg.get('api_key') or '').strip()
     if not token:
         raise SteamSMMError(f'API-ключ {PROVIDERS[provider]} не настроен.', code='NO_API_KEY')
+    try:
+        token.encode('latin-1')
+    except UnicodeEncodeError:
+        raise SteamSMMError(
+            f'API-ключ {PROVIDERS[provider]} содержит недопустимые символы (возможно, скопирован сокращённый ключ с «…»).',
+            code='INVALID_API_KEY'
+        )
+    method = str(method or 'GET').upper()
     headers = {'X-API-Key': token, 'Accept': 'application/json', 'User-Agent': f'{NAME}/{VERSION}'}
+    if payload is not None:
+        headers['Content-Type'] = 'application/json'
     if idem:
         headers['Idempotency-Key'] = str(idem)
     proxies = _proxy_requests(cfg)
-    try:
-        response = _HTTP.request(method, PROVIDER_BASES[provider] + path, headers=headers,
-                                 json=payload, timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT),
-                                 proxies=proxies)
-    except requests.RequestException:
-        raise SteamSMMError(f'{PROVIDERS[provider]}: нет ответа сервера.', code='NETWORK_ERROR', retryable=True)
-    try:
-        body = response.json()
-    except Exception:
-        raise SteamSMMError(f'{PROVIDERS[provider]}: некорректный ответ HTTP {response.status_code}.',
-                            status=response.status_code, code='INVALID_RESPONSE', retryable=True)
-    if 200 <= response.status_code < 300 and isinstance(body, (dict, list)):
-        if not isinstance(body, dict) or (body.get('success') is not False and not body.get('error')):
-            return body
-    detail = body.get('detail') or body.get('message') or body.get('error') if isinstance(body, dict) else ''
-    if isinstance(detail, dict):
-        detail = detail.get('message') or detail.get('error') or str(detail)
-    code = str(body.get('code') or body.get('error') or '') if isinstance(body, dict) else ''
-    code = {'no_stock': 'NO_STOCK', 'insufficient_balance': 'INSUFFICIENT_BALANCE',
-            'not_found': 'RENTAL_NOT_FOUND' if (path.startswith('/rental/') or path.startswith('/rentals/')) else 'PRODUCT_NOT_FOUND'}.get(code, code)
+    timeout = (HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT)
 
-    message = str(detail or f'HTTP {response.status_code}').replace(token, '[скрыто]')[:300]
-    raise SteamSMMError(f'{PROVIDERS[provider]}: {message}', response.status_code, code,
-                        response.status_code >= 500 or response.status_code == 429)
+    if provider == 'muvsell':
+        if urgent is None:
+            urgent = (method == 'POST' and path != '/rental/quote') or path.endswith('/code')
+        if idempotent is None:
+            idempotent = (
+                method == 'GET'
+                or path == '/rental/quote'
+                or bool(isinstance(payload, dict) and payload.get('requestId'))
+            )
+        tries = (len(MUVSELL_URGENT_WAITS) + 1) if urgent else (3 if idempotent else 1)
+        last_err = None
+        for attempt in range(tries):
+            _muvsell_api_slot(urgent=bool(urgent))
+            try:
+                response = _muvsell_send_routes(method, path, headers, payload, proxies, bool(idempotent), timeout)
+            except requests.RequestException as exc:
+                last_err = SteamSMMError(f'Muvsell: нет ответа сервера ({_redact_proxy_error(exc, cfg)[:120]}).',
+                                         code='NETWORK_ERROR', retryable=True)
+                if (idempotent or _request_unsent(exc)) and attempt < min(tries - 1, 2):
+                    time.sleep(2.0)
+                    continue
+                raise last_err
+            try:
+                body = response.json()
+            except Exception:
+                body = None
+            if 200 <= response.status_code < 300 and isinstance(body, (dict, list)):
+                if not isinstance(body, dict) or (body.get('success') is not False and not body.get('error')):
+                    return body
+            err_code, err_msg = _external_error_details(provider, path, response.status_code, body, token)
+            if response.status_code == 429 and re.search(r'лимит api', err_msg, re.I):
+                with _MUVSELL_RATE_LOCK:
+                    _MUVSELL_COOL_UNTIL = max(_MUVSELL_COOL_UNTIL, time.time() + MUVSELL_API_COOL_SEC)
+                if urgent and attempt < tries - 1:
+                    wait_s = MUVSELL_URGENT_WAITS[min(attempt, len(MUVSELL_URGENT_WAITS) - 1)]
+                    logger.warning('Muvsell: лимит запросов ключа (%s %s) · жду %s сек.', method, path, wait_s)
+                    time.sleep(wait_s)
+                    continue
+            elif response.status_code == 429 and attempt < tries - 1 and not re.search(r'через|уже|не больше', err_msg, re.I):
+                time.sleep(5.0)
+                continue
+            if (response.status_code >= 500 or body is None) and idempotent and attempt < tries - 1:
+                time.sleep(2.0)
+                continue
+            if body is None:
+                raise SteamSMMError(f'Muvsell: некорректный ответ HTTP {response.status_code}.',
+                                    status=response.status_code, code='INVALID_RESPONSE', retryable=True)
+            raise SteamSMMError(f'Muvsell: {err_msg}', response.status_code, err_code,
+                                response.status_code >= 500 or response.status_code == 429, body)
+        raise last_err or SteamSMMError('Muvsell: нет ответа сервера.', code='NETWORK_ERROR', retryable=True)
+
+    if provider == 'kosell':
+        if idempotent is None:
+            idempotent = (
+                method == 'GET'
+                or path in {'/rental/calculate-price', '/rental/calculate-extend-price'}
+                or bool(idem)
+            )
+        attempts = 3 if idempotent else 1
+        last_err = None
+        for attempt in range(attempts):
+            host = _kosell_hosts_order()[0]
+            url = host + '/api/v1' + path
+            try:
+                response = _HTTP.request(method, url, headers=headers, params=params, json=payload,
+                                         timeout=timeout, proxies=proxies, allow_redirects=False)
+            except requests.RequestException as exc:
+                next_host = _kosell_rotate_host()
+                last_err = SteamSMMError(f'Kosell: нет ответа сервера ({_redact_proxy_error(exc, cfg)[:120]}).',
+                                         code='NETWORK_ERROR', retryable=True)
+                if (idempotent or _request_unsent(exc)) and attempt < attempts - 1:
+                    logger.warning('Kosell: ошибка сети (%s), переключаюсь на %s', path, next_host)
+                    time.sleep(0.6)
+                    continue
+                raise last_err
+            try:
+                body = response.json()
+            except Exception:
+                body = None
+            if 200 <= response.status_code < 300 and isinstance(body, (dict, list)):
+                if not isinstance(body, dict) or (body.get('success') is not False and not body.get('error')):
+                    return body
+            edge_error = (
+                response.status_code >= 500
+                or 300 <= response.status_code < 400
+                or body is None
+                or (response.status_code == 403 and not isinstance(body, dict))
+            )
+            if edge_error:
+                next_host = _kosell_rotate_host()
+                if idempotent and attempt < attempts - 1:
+                    logger.warning('Kosell: HTTP %s (%s), переключаюсь на %s', response.status_code, path, next_host)
+                    time.sleep(0.6)
+                    continue
+                raise SteamSMMError(f'Kosell: шлюз временно недоступен (HTTP {response.status_code}).',
+                                    status=response.status_code, code='INVALID_RESPONSE', retryable=True)
+            err_code, err_msg = _external_error_details(provider, path, response.status_code, body, token)
+            raise SteamSMMError(f'Kosell: {err_msg}', response.status_code, err_code,
+                                response.status_code >= 500 or response.status_code == 429, body)
+        raise last_err or SteamSMMError('Kosell: нет ответа сервера.', code='NETWORK_ERROR', retryable=True)
+
+    if idempotent is None:
+        idempotent = method == 'GET' or bool(idem)
+    attempts = 2 if idempotent else 1
+    last_err = None
+    for attempt in range(attempts):
+        try:
+            response = _HTTP.request(method, PROVIDER_BASES[provider] + path, headers=headers,
+                                     params=params, json=payload, timeout=timeout, proxies=proxies)
+        except requests.RequestException:
+            last_err = SteamSMMError(f'{PROVIDERS[provider]}: нет ответа сервера.', code='NETWORK_ERROR', retryable=True)
+            if attempt < attempts - 1:
+                time.sleep(1.0)
+                continue
+            raise last_err
+        try:
+            body = response.json()
+        except Exception:
+            if idempotent and attempt < attempts - 1:
+                time.sleep(1.0)
+                continue
+            raise SteamSMMError(f'{PROVIDERS[provider]}: некорректный ответ HTTP {response.status_code}.',
+                                status=response.status_code, code='INVALID_RESPONSE', retryable=True)
+        if 200 <= response.status_code < 300 and isinstance(body, (dict, list)):
+            if not isinstance(body, dict) or (body.get('success') is not False and not body.get('error')):
+                return body
+        err_code, err_msg = _external_error_details(provider, path, response.status_code, body, token)
+        if response.status_code >= 500 and idempotent and attempt < attempts - 1:
+            time.sleep(1.0)
+            continue
+        raise SteamSMMError(f'{PROVIDERS[provider]}: {err_msg}', response.status_code, err_code,
+                            response.status_code >= 500 or response.status_code == 429, body)
+    raise last_err or SteamSMMError(f'{PROVIDERS[provider]}: нет ответа сервера.', code='NETWORK_ERROR', retryable=True)
+
+def _muv_extract_account(data, expected_login=''):
+    raw = data.get('rental', data) if isinstance(data, dict) else {}
+    accounts = []
+    for item in (raw.get('items') or []):
+        if isinstance(item, dict):
+            for acc in (item.get('accounts') or []):
+                if isinstance(acc, dict):
+                    accounts.append(acc)
+    if not accounts and isinstance(data, dict):
+        for acc in (data.get('accounts') or []):
+            if isinstance(acc, dict):
+                accounts.append(acc)
+    if expected_login:
+        low = str(expected_login).strip().casefold()
+        for acc in accounts:
+            if str(acc.get('login') or '').strip().casefold() == low:
+                return dict(acc)
+    return dict(accounts[0]) if accounts else {}
 
 def _external_rental(provider, data):
-    raw = data.get('rental', data)
+    raw = data.get('rental', data) if isinstance(data, dict) else {}
     result = dict(raw)
     if provider == 'tdugame':
         result.update(rental_id=raw.get('rentalUid'), starts_at=raw.get('createdAt'),
@@ -1172,23 +1468,119 @@ def _external_rental(provider, data):
         result.update(rental_id=raw.get('rental_uid'), starts_at=raw.get('started_at'),
                       ends_at=raw.get('new_expires_at') or raw.get('expires_at'),
                       amount=raw.get('price_rub') if raw.get('price_rub') is not None else raw.get('price_paid'))
+        if raw.get('steam_login'):
+            result['login'] = raw.get('steam_login')
+        if raw.get('steam_password'):
+            result['password'] = raw.get('steam_password')
     else:
         result.update(rental_id=raw.get('id'), starts_at=raw.get('createdAt'),
-                      ends_at=raw.get('endsAt') or data.get('endsAt'), amount=raw.get('totalRub', data.get('cost')))
-        items = raw.get('items') or []
-        accounts = items[0].get('accounts', []) if items else []
-        if len(accounts) == 1:
-            result.update(login=accounts[0].get('login'), password=accounts[0].get('password'))
+                      ends_at=raw.get('endsAt') or (data.get('endsAt') if isinstance(data, dict) else None),
+                      amount=raw.get('totalRub', data.get('cost') if isinstance(data, dict) else None))
+        acc = _muv_extract_account(data)
+        if acc:
+            if acc.get('login'):
+                result['login'] = acc.get('login')
+            if acc.get('password'):
+                result['password'] = acc.get('password')
     if result.get('status') == 'completed':
         result['status'] = 'ended'
     return result
 
-def _muv_game(cfg, product_id):
-    rows = _api_products(cfg).get('products', [])
+def _muv_product(cfg, product_id, force=False):
+    rows = _api_products(cfg, force=force).get('products', [])
     matches = [r for r in rows if int(r['product_id']) == int(product_id)]
     if len(matches) != 1:
+        if not force:
+            rows = _api_products(cfg, force=True).get('products', [])
+            matches = [r for r in rows if int(r['product_id']) == int(product_id)]
+    if len(matches) != 1:
         raise SteamSMMError('Игра Muvsell не найдена однозначно.', code='PRODUCT_NOT_FOUND')
-    return matches[0]['game_id']
+    return matches[0]
+
+def _muv_game(cfg, product_id):
+    return _muv_product(cfg, product_id)['game_id']
+
+def _muv_pay_with(cfg):
+    rub = _as_float(cfg.get('regular_balance') if cfg.get('regular_balance') is not None else cfg.get('balance'), -1.0)
+    usd = _as_float(cfg.get('balance_usd'), 0.0)
+    if rub == 0.0 and usd > 0:
+        return 'usd'
+    return 'rub'
+
+def _muv_paid_post(cfg, path, payload, idem=None):
+    try:
+        return _external_request(cfg, 'POST', path, payload, idem=idem, idempotent=bool(payload.get('requestId')), urgent=True)
+    except SteamSMMError as exc:
+        if exc.code == 'INSUFFICIENT_BALANCE' or exc.status == 402:
+            cur = str(payload.get('payWith') or 'rub')
+            alt = 'usd' if cur == 'rub' else 'rub'
+            alt_bal = _as_float(cfg.get('balance_usd'), 0.0) if alt == 'usd' else _as_float(cfg.get('regular_balance'), 0.0)
+            if alt_bal > 0:
+                alt_payload = dict(payload, payWith=alt)
+                return _external_request(cfg, 'POST', path, alt_payload, idem=idem,
+                                         idempotent=bool(alt_payload.get('requestId')), urgent=True)
+        raise
+
+def _muv_prefetch_quotes(cfg, lots_rows, products_data=None):
+    fp = _api_key_fp(cfg)
+    prods = (products_data or _api_products(cfg)).get('products', [])
+    by_pid = {int(p['product_id']): p for p in prods}
+    need, seen = [], set()
+    now = time.time()
+    for row in lots_rows or []:
+        if _provider_id(row) != 'muvsell':
+            continue
+        prod = by_pid.get(int(row.get('product_id') or 0))
+        if not prod or not prod.get('game_id'):
+            continue
+        hours = int(row.get('duration_hours') or 0)
+        if hours < 1:
+            continue
+        if any(p.get('hours') == hours and p.get('priceRub') is not None for p in (prod.get('prices') or [])):
+            continue
+        qkey = (fp, str(prod['game_id']), hours)
+        with _MUVSELL_QUOTE_CACHE_LOCK:
+            hit = _MUVSELL_QUOTE_CACHE.get(qkey)
+        if hit and now - hit[0] < 900:
+            continue
+        if qkey not in seen:
+            seen.add(qkey)
+            need.append((prod, hours))
+    if not need:
+        return
+
+    def ask(chunk):
+        try:
+            data = _external_request(
+                cfg, 'POST', '/rental/quote',
+                {'items': [{'gameId': p['game_id'], 'durationKey': f'{h}h', 'qty': 1} for p, h in chunk]},
+                idempotent=True, urgent=False
+            )
+            items = data.get('items') if isinstance(data, dict) else None
+            if isinstance(items, list) and len(items) == len(chunk):
+                ts = time.time()
+                with _MUVSELL_QUOTE_CACHE_LOCK:
+                    for (prod, h), it in zip(chunk, items):
+                        rub = it.get('lineTotalRub', it.get('unitPriceRub')) if isinstance(it, dict) else None
+                        if rub is not None:
+                            _MUVSELL_QUOTE_CACHE[(fp, str(prod['game_id']), h)] = (ts, float(rub))
+                return
+        except SteamSMMError as exc:
+            if exc.status != 400:
+                return
+        if len(chunk) == 1:
+            prod, h = chunk[0]
+            hourly = _as_float(prod.get('price_per_hour') or prod.get('pricePerHourRub'), 0.0)
+            if hourly > 0:
+                with _MUVSELL_QUOTE_CACHE_LOCK:
+                    _MUVSELL_QUOTE_CACHE[(fp, str(prod['game_id']), h)] = (time.time(), round(hourly * h, 2))
+            return
+        half = len(chunk) // 2
+        ask(chunk[:half])
+        ask(chunk[half:])
+
+    for i in range(0, len(need), MUVSELL_QUOTE_BATCH):
+        ask(need[i:i + MUVSELL_QUOTE_BATCH])
 
 def _single_account(data, key):
     rows = data.get(key) or []
@@ -1216,7 +1608,7 @@ def _once_operation(cfg, operation, idem, call, recover=None):
         try:
             result = call()
         except SteamSMMError as error:
-            if error.status in (400, 401, 403, 404, 422, 429):
+            if error.status in (400, 401, 402, 403, 404, 422, 429):
                 ledger.pop(key, None)
                 _atomic_json(OPERATIONS_FILE, ledger, OPERATIONS_FILE + '.bak')
                 raise
@@ -1243,24 +1635,40 @@ def _external_rent(cfg, product_id, hours, idem):
             pass
         return result
     if provider == 'kosell':
-        return _external_rental(provider, _external_request(cfg, 'POST', '/rental/rent',
-            {'product_id': int(product_id), 'duration_hours': int(hours), 'currency': 'RUB', 'idempotency_key': str(idem)}, idem))
+        return _external_rental(provider, _external_request(
+            cfg, 'POST', '/rental/rent',
+            {'product_id': int(product_id), 'duration_hours': int(hours), 'currency': 'RUB', 'idempotency_key': str(idem)},
+            idem=idem, idempotent=True
+        ))
     game = _muv_game(cfg, product_id)
-    marker = 'FPC:' + str(idem)
-    def recover():
-        rows = _external_request(cfg, 'GET', '/rental/orders').get('rentals', [])
-        matches = [r for r in rows if r.get('comment') == marker]
-        if len(matches) == 1:
-            return {k: _external_rental(provider, matches[0]).get(k) for k in ('rental_id', 'status', 'starts_at', 'ends_at', 'amount')}
-        return None
-    def purchase():
-        result = _external_rental(provider, _external_request(cfg, 'POST', '/rental/create',
-            {'items': [{'gameId': game, 'durationKey': f'{int(hours)}h', 'qty': 1}], 'payWith': 'rub', 'comment': marker}))
-        if not result.get('rental_id'):
-            raise SteamSMMError('Нет ID аренды.', code='INVALID_RESPONSE')
-
-        return {k: result.get(k) for k in ('rental_id', 'status', 'starts_at', 'ends_at', 'amount')}
-    return _once_operation(cfg, 'rent', idem, purchase, recover)
+    total_hours = int(hours)
+    first = min(total_hours, MUVSELL_MAX_HOURS)
+    pay_with = _muv_pay_with(cfg)
+    raw = _muv_paid_post(cfg, '/rental/create', {
+        'items': [{'gameId': game, 'durationKey': f'{first}h', 'qty': 1}],
+        'payWith': pay_with,
+        'comment': str(idem),
+        'requestId': str(idem),
+    })
+    result = _external_rental(provider, raw)
+    if not result.get('rental_id'):
+        raise SteamSMMError('Muvsell: нет ID аренды в ответе.', code='INVALID_RESPONSE')
+    added = first
+    total_amount = _as_float(result.get('amount'), 0.0)
+    while added < total_hours:
+        step = min(total_hours - added, MUVSELL_MAX_HOURS)
+        ext_raw = _muv_paid_post(cfg, f'/rental/{_rental_path_id(result["rental_id"])}/extend', {
+            'durationKey': f'{step}h',
+            'payWith': pay_with,
+            'requestId': f'{idem}:more:{added}',
+        })
+        ext_res = _external_rental(provider, ext_raw)
+        if ext_res.get('ends_at'):
+            result['ends_at'] = ext_res['ends_at']
+        total_amount += _as_float(ext_res.get('amount'), 0.0)
+        added += step
+    result['amount'] = round(total_amount, 2)
+    return result
 
 def _external_extend(cfg, rental_id, hours, idem):
     provider = _provider_id(cfg)
@@ -1270,9 +1678,30 @@ def _external_extend(cfg, rental_id, hours, idem):
         if not isinstance(raw, dict) or not raw.get('expiresAt'):
             raise SteamSMMError('TDUgame не подтвердил новый срок аренды.', code='PAYMENT_UNCERTAIN')
         return {'rental_id': rental_id, 'ends_at': raw['expiresAt'], 'amount': raw.get('priceRub')}
-    payload = {'hours': int(hours), 'currency': 'RUB'} if provider == 'kosell' else {'durationKey': f'{int(hours)}h', 'payWith': 'rub'}
+    if provider == 'muvsell':
+        total_hours = int(hours)
+        added = 0
+        total_amount = 0.0
+        ends_at = None
+        pay_with = _muv_pay_with(cfg)
+        while added < total_hours:
+            step = min(total_hours - added, MUVSELL_MAX_HOURS)
+            req_id = str(idem) if added == 0 else f'{idem}:{added}'
+            raw = _muv_paid_post(cfg, f'/rental/{_rental_path_id(rental_id)}/extend', {
+                'durationKey': f'{step}h',
+                'payWith': pay_with,
+                'requestId': req_id,
+            })
+            res = _external_rental(provider, raw)
+            if not res.get('ends_at'):
+                raise SteamSMMError('Muvsell: нет нового срока аренды.', code='INVALID_RESPONSE')
+            ends_at = res['ends_at']
+            total_amount += _as_float(res.get('amount'), 0.0)
+            added += step
+        return {'rental_id': rental_id, 'ends_at': ends_at, 'amount': round(total_amount, 2)}
+    payload = {'hours': int(hours), 'currency': 'RUB'}
     def extend():
-        raw = _external_request(cfg, 'POST', f'/rental/{_rental_path_id(rental_id)}/extend', payload)
+        raw = _external_request(cfg, 'POST', f'/rental/{_rental_path_id(rental_id)}/extend', payload, idempotent=False)
         result = _external_rental(provider, raw)
         if not result.get('ends_at'):
             raise SteamSMMError('Нет нового срока аренды.', code='INVALID_RESPONSE')
@@ -1282,7 +1711,8 @@ def _external_extend(cfg, rental_id, hours, idem):
 def _api_extension_price(cfg, record, hours):
     if _provider_id(cfg) == 'kosell':
         result = _external_request(cfg, 'POST', '/rental/calculate-extend-price',
-                                   {'rental_uid': str(record['rental_id']), 'hours': int(hours)})
+                                   {'rental_uid': str(record['rental_id']), 'hours': int(hours)},
+                                   idempotent=True)
         return {'total_cost': result['total_rub']}
     return _api_calculate_price(cfg, record['product_id'], hours)
 
@@ -1291,7 +1721,7 @@ def _balance_display(info, provider):
     rub = info.get('regular_balance')
     if rub is None:
         rub = info.get('balance')
-    usd = info.get('balance_usd') if provider == 'kosell' else None
+    usd = info.get('balance_usd') if provider in {'kosell', 'muvsell'} else None
     parts = []
     if rub is not None:
         parts.append(f'{_as_float(rub):.2f} ₽')
@@ -1478,8 +1908,8 @@ def _api_balance(cfg):
         rub = raw.get('balance_rub') if provider == 'kosell' else raw.get('balanceRub')
         if rub is None:
             rub = nested.get('RUB') if 'RUB' in nested else nested.get('rub')
-        usd = (raw.get('balance_usd', raw.get('balanceUsd')) if provider == 'kosell' else None)
-        if usd is None and provider == 'kosell':
+        usd = (raw.get('balance_usd', raw.get('balanceUsd')) if provider in {'kosell', 'muvsell'} else None)
+        if usd is None and provider in {'kosell', 'muvsell'}:
             usd = nested.get('USD') if 'USD' in nested else nested.get('usd')
         if rub is None and usd is None:
             raise SteamSMMError('API не вернул баланс RUB или USD.', code='INVALID_RESPONSE')
@@ -1500,19 +1930,33 @@ def _api_balance(cfg):
                 'balance_usd': usd, 'currency': 'RUB' if rub is not None else 'USD'}
     return _steamsmm_request(cfg, 'GET', '/user/balance', retries=2).get('data') or {}
 
-def _api_products(cfg):
+def _api_products(cfg, force=False):
     provider = _provider_id(cfg)
     if provider != 'steamsmm':
-        raw = _external_request(cfg, 'GET', '/products' if provider == 'tdugame' else '/rental/products')
+        cache_key = (provider, _api_key_fp(cfg))
+        ttl = 300 if provider == 'muvsell' else 120
+        if not force:
+            with _PROVIDER_PRODUCTS_CACHE_LOCK:
+                cached = _PROVIDER_PRODUCTS_CACHE.get(cache_key)
+                if cached and time.time() - cached[0] < ttl:
+                    return {'products': [dict(r) for r in cached[1]]}
+        params = {'currency': 'RUB'} if provider == 'kosell' else None
+        raw = _external_request(cfg, 'GET', '/products' if provider == 'tdugame' else '/rental/products', params=params)
         rows = raw if isinstance(raw, list) else raw.get('products', [])
         products = []
         for row in rows:
+            if not isinstance(row, dict):
+                continue
             if provider == 'kosell':
-                products.append(dict(row, product_id=row['id'], price_per_hour=row['price_per_hour_rub'], stock=row['available_accounts']))
+                products.append(dict(row, product_id=row['id'], price_per_hour=row.get('price_per_hour_rub'), stock=row.get('available_accounts')))
             elif provider == 'tdugame':
                 products.append(dict(row, product_id=row['id'], price_per_hour=row.get('pricePerHourRub'), stock=row.get('availableAccounts')))
             else:
-                products.append(dict(row, product_id=row['lotId'], game_id=row['id'], price_per_hour=row.get('pricePerHourRub'), stock=row['inStock'] if row.get('available') else 0))
+                pid = row.get('lotId') if row.get('lotId') is not None else row.get('id')
+                products.append(dict(row, product_id=pid, game_id=row['id'], price_per_hour=row.get('pricePerHourRub'),
+                                     stock=int(row.get('inStock') or 0) if row.get('available') else 0))
+        with _PROVIDER_PRODUCTS_CACHE_LOCK:
+            _PROVIDER_PRODUCTS_CACHE[cache_key] = (time.time(), [dict(r) for r in products])
         return {'products': products}
     return _steamsmm_request(cfg, 'GET', '/rentals/products', retries=2).get('data') or {}
 
@@ -1522,11 +1966,41 @@ def _api_calculate_price(cfg, product_id, hours):
         raw = _external_request(cfg, 'POST', f'/products/{int(product_id)}/quote', {'hours': int(hours), 'quantity': 1})
         return {'total_cost': raw['priceRub']}
     if provider == 'kosell':
-        raw = _external_request(cfg, 'POST', '/rental/calculate-price', {'product_id': int(product_id), 'hours': int(hours)})
+        raw = _external_request(cfg, 'POST', '/rental/calculate-price', {'product_id': int(product_id), 'hours': int(hours)}, idempotent=True)
         return {'total_cost': raw['total_rub']}
     if provider == 'muvsell':
-        raw = _external_request(cfg, 'POST', '/rental/quote', {'gameId': _muv_game(cfg, product_id), 'durationKey': f'{int(hours)}h', 'qty': 1})
-        return {'total_cost': raw['totalRub']}
+        hours_i = int(hours)
+        prod = _muv_product(cfg, product_id)
+        for p in (prod.get('prices') or []):
+            if p.get('hours') == hours_i and p.get('priceRub') is not None:
+                return {'total_cost': float(p['priceRub'])}
+        qkey = (_api_key_fp(cfg), str(prod['game_id']), hours_i)
+        with _MUVSELL_QUOTE_CACHE_LOCK:
+            hit = _MUVSELL_QUOTE_CACHE.get(qkey)
+        if hit and time.time() - hit[0] < 900:
+            return {'total_cost': hit[1]}
+        try:
+            raw = _external_request(cfg, 'POST', '/rental/quote',
+                                    {'gameId': prod['game_id'], 'durationKey': f'{hours_i}h', 'qty': 1},
+                                    idempotent=True, urgent=False)
+            total = raw.get('totalRub')
+            if total is not None:
+                val = float(total)
+                with _MUVSELL_QUOTE_CACHE_LOCK:
+                    _MUVSELL_QUOTE_CACHE[qkey] = (time.time(), val)
+                return {'total_cost': val}
+        except SteamSMMError as exc:
+            hourly = _as_float(prod.get('price_per_hour') or prod.get('pricePerHourRub'), 0.0)
+            if exc.status == 400 and hourly > 0:
+                val = round(hourly * hours_i, 2)
+                with _MUVSELL_QUOTE_CACHE_LOCK:
+                    _MUVSELL_QUOTE_CACHE[qkey] = (time.time(), val)
+                return {'total_cost': val}
+            raise
+        hourly = _as_float(prod.get('price_per_hour') or prod.get('pricePerHourRub'), 0.0)
+        if hourly > 0:
+            return {'total_cost': round(hourly * hours_i, 2)}
+        raise SteamSMMError('Muvsell не вернул стоимость аренды.', code='INVALID_RESPONSE')
     body = _steamsmm_request(cfg, 'POST', '/rentals/calculate-price', {
         'product_id': int(product_id), 'duration_hours': int(hours)
     }, retries=2)
@@ -1562,36 +2036,78 @@ def _api_status(cfg, rental_id):
     if provider == 'tdugame':
         return _external_rental(provider, _external_request(cfg, 'GET', f'/rentals/{_rental_path_id(rental_id)}'))
     if provider == 'kosell':
-        rows = _external_request(cfg, 'GET', '/rental/active')
+        raw = _external_request(cfg, 'GET', '/rental/active')
+        rows = raw if isinstance(raw, list) else (raw.get('rentals') or raw.get('data') or [] if isinstance(raw, dict) else [])
         for row in rows:
-            if str(row.get('rental_uid')) == str(rental_id):
+            if isinstance(row, dict) and str(row.get('rental_uid')) == str(rental_id):
                 return _external_rental(provider, row)
+        try:
+            delivery = _external_request(cfg, 'GET', f'/rental/delivery/{_rental_path_id(rental_id)}')
+            if isinstance(delivery, dict) and str(delivery.get('state') or '').lower() in {'checking', 'preparing', 'ready'}:
+                return {'status': 'active', 'rental_id': str(rental_id)}
+        except SteamSMMError:
+            pass
         return {'status': 'ended'}
     if provider == 'muvsell':
         return _external_rental(provider, _external_request(cfg, 'GET', f'/rental/{_rental_path_id(rental_id)}'))
     rid = _rental_path_id(rental_id)
     return (_steamsmm_request(cfg, 'GET', f'/rentals/{rid}/status', retries=2).get('data') or {})
 
-def _api_credentials(cfg, rental_id):
+def _api_credentials(cfg, rental_id, expected_login=''):
     provider = _provider_id(cfg)
+    if provider == 'muvsell':
+        raw = _external_request(cfg, 'GET', f'/rental/{_rental_path_id(rental_id)}', urgent=True)
+        acc = _muv_extract_account(raw, expected_login=expected_login)
+        if not acc:
+            raise SteamSMMError('Muvsell пока не вернул данные аккаунта.', code='CREDENTIALS_UNAVAILABLE', retryable=True)
+        return acc
     if provider != 'steamsmm':
         prefix = '/rentals' if provider == 'tdugame' else '/rental'
-        raw = _external_request(cfg, 'GET', f'{prefix}/{_rental_path_id(rental_id)}/credentials')
-        return _single_account(raw, 'accounts') if provider == 'muvsell' else raw
+        return _external_request(cfg, 'GET', f'{prefix}/{_rental_path_id(rental_id)}/credentials')
     rid = _rental_path_id(rental_id)
     return (_steamsmm_request(cfg, 'GET', f'/rentals/{rid}/credentials', retries=2).get('data') or {})
 
-def _api_guard(cfg, rental_id):
+def _api_guard(cfg, rental_id, expected_login=''):
     provider = _provider_id(cfg)
+    if provider == 'muvsell':
+        rid_path = _rental_path_id(rental_id)
+        for attempt in range(2):
+            raw = _external_request(cfg, 'GET', f'/rental/{rid_path}/code', urgent=True)
+            codes = (raw.get('codes') or []) if isinstance(raw, dict) else []
+            chosen = None
+            if expected_login:
+                low = str(expected_login).strip().casefold()
+                chosen = next((c for c in codes if isinstance(c, dict) and str(c.get('login') or '').strip().casefold() == low), None)
+            if chosen is None:
+                chosen = next((c for c in codes if isinstance(c, dict) and (c.get('code') or c.get('guard_code'))), None)
+            if not chosen or not (chosen.get('code') or chosen.get('guard_code')):
+                raise SteamSMMError('Steam Guard пока не доступен.', code='GUARD_UNAVAILABLE')
+            ttl = _as_int(chosen.get('expiresIn'), 30)
+            if attempt == 0 and 0 < ttl < 5:
+                time.sleep(min(ttl + 1, 6))
+                continue
+            return dict(chosen)
+        raise SteamSMMError('Steam Guard пока не доступен.', code='GUARD_UNAVAILABLE')
+    if provider == 'kosell':
+        rid_path = _rental_path_id(rental_id)
+        for attempt in range(2):
+            raw = _external_request(cfg, 'GET', f'/rental/{rid_path}/code', idempotent=True)
+            if not isinstance(raw, dict) or not (raw.get('code') or raw.get('guard_code')):
+                raise SteamSMMError('Steam Guard пока не доступен.', code='GUARD_UNAVAILABLE')
+            ttl = _as_int(raw.get('expires_in'), 30)
+            if attempt == 0 and 0 < ttl < 5:
+                time.sleep(min(ttl + 1, 6))
+                continue
+            return dict(raw)
+        raise SteamSMMError('Steam Guard пока не доступен.', code='GUARD_UNAVAILABLE')
     if provider != 'steamsmm':
         prefix = '/rentals' if provider == 'tdugame' else '/rental'
         raw = _external_request(cfg, 'GET', f'{prefix}/{_rental_path_id(rental_id)}/code')
-        result = _single_account(raw, 'codes') if provider == 'muvsell' else raw
-        if not (result.get('code') or result.get('guard_code')):
+        if not isinstance(raw, dict) or not (raw.get('code') or raw.get('guard_code')):
             raise SteamSMMError('Steam Guard пока не доступен.', code='GUARD_UNAVAILABLE')
-        return result
+        return raw
     rid = _rental_path_id(rental_id)
-    return (_steamsmm_request(cfg, 'GET', f'/rentals/{rid}/guard-code', retries=1).get('data') or {})
+    return (_steamsmm_request(cfg, 'GET', f'/rentals/{rid}/guard-code', retries=2).get('data') or {})
 
 def _stock_scalar(value):
     if value is None:
@@ -1923,11 +2439,12 @@ def _credentials_for_record(cfg, record):
             return rec, replay
         rental_id = _normalize_rental_id(rec.get('rental_id'))
 
+    expected_login = str(rec.get('account_login') or '').strip()
     not_found = []
     candidates = _cfg_candidates_for_record(rec, cfg)
     for owner_key, candidate_cfg, fp in candidates:
         try:
-            data = _api_credentials(candidate_cfg, rental_id)
+            data = _api_credentials(candidate_cfg, rental_id, expected_login=expected_login)
             rec = _claim_rental_owner(rec, owner_key, candidate_cfg)
             rec['rental_id_verified'] = True
             rec['rental_id_verified_by'] = 'credentials'
@@ -1953,7 +2470,7 @@ def _credentials_for_record(cfg, record):
             return rec, replay
 
         owner_cfg = _cfg_for_record(rec, owner_cfg)
-        return rec, _api_credentials(owner_cfg, rec['rental_id'])
+        return rec, _api_credentials(owner_cfg, rec['rental_id'], expected_login=expected_login)
     except SteamSMMError as e:
         if e.code in {'RENTAL_API_INCONSISTENT', 'RENTAL_OWNER_UNKNOWN', 'RENTAL_REPLAY_COOLDOWN'}:
             raise
@@ -2209,6 +2726,13 @@ def _notification_allowed(cfg, kind='general'):
     key = mapping.get(str(kind or 'general'))
     return True if not key else bool(cfg.get(key, True))
 
+def _tg_notify_executor():
+    global _TG_NOTIFY_EXECUTOR
+    with _TG_NOTIFY_EXECUTOR_LOCK:
+        if _TG_NOTIFY_EXECUTOR is None:
+            _TG_NOTIFY_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix='AUTO-RENTAL-TG')
+        return _TG_NOTIFY_EXECUTOR
+
 def _notify_admin(text, cfg=None, kind='general', owner_key=None):
     cardinal = _CARDINAL_REF
     if cardinal is None:
@@ -2224,6 +2748,7 @@ def _notify_admin(text, cfg=None, kind='general', owner_key=None):
         for key, raw in settings.items():
             if isinstance(raw, dict) and _has_provider_keys(raw):
                 targets.append((str(key), _sanitize_cfg(raw)))
+    cids = []
     sent = set()
     for key, target_cfg in targets:
         active_cfg = _sanitize_cfg(cfg) if isinstance(cfg, dict) and _has_provider_keys(cfg) else target_cfg
@@ -2236,10 +2761,19 @@ def _notify_admin(text, cfg=None, kind='general', owner_key=None):
         if cid in sent:
             continue
         sent.add(cid)
-        try:
-            bot.send_message(cid, text, parse_mode='HTML', disable_web_page_preview=True)
-        except Exception:
-            pass
+        cids.append(cid)
+    if not cids:
+        return
+    def _deliver():
+        for cid in cids:
+            try:
+                bot.send_message(cid, text, parse_mode='HTML', disable_web_page_preview=True)
+            except Exception:
+                pass
+    try:
+        _tg_notify_executor().submit(_deliver)
+    except Exception:
+        pass
 
 def _schedule(key, fn, *args, **kwargs):
     with _JOBS_LOCK:
@@ -2610,10 +3144,99 @@ def _funpay_safe_save_lot(save_lot, lot_fields):
         _funpay_lot_observe_error(e)
         raise
 
+def _cache_lot_fields(lot_id, fields):
+    if fields is None:
+        return
+    try:
+        lid = int(lot_id)
+    except Exception:
+        return
+    texts = []
+    summaries = []
+    for attr in ('title', 'summary', 'name', 'description'):
+        value = getattr(fields, attr, None)
+        if value:
+            s = str(value).strip()
+            if s:
+                if s not in texts:
+                    texts.append(s)
+                if attr in {'title', 'summary', 'name'} and s not in summaries:
+                    summaries.append(s)
+    raw = _lot_raw_fields(fields) or {}
+    for key, value in raw.items():
+        lk = str(key).lower()
+        if not value:
+            continue
+        s = str(value).strip()
+        if not s:
+            continue
+        if any(token in lk for token in ('summary', 'desc', 'title', 'type', 'game', 'platform', 'edition', 'region')):
+            if s not in texts:
+                texts.append(s)
+            if ('summary' in lk or 'title' in lk) and s not in summaries:
+                summaries.append(s)
+        elif isinstance(value, str) and len(value) <= 120 and not any(token in lk for token in ('csrf', 'token', 'password', 'payment_msg')):
+            if s not in texts:
+                texts.append(s)
+    structured = set()
+    ignored = ('csrf', 'token', 'payment_msg', 'desc', 'summary', 'images', 'secrets', 'active', 'deleted', 'price', 'amount', 'offer_id')
+    for key, value in raw.items():
+        low = str(key).lower()
+        if any(part in low for part in ignored):
+            continue
+        structured.update(_flatten_match_values(key))
+        structured.update(_flatten_match_values(value))
+    for attr in ('server', 'side'):
+        obj = getattr(fields, attr, None)
+        if obj is not None:
+            structured.update(_flatten_match_values(getattr(obj, 'name', None)))
+            structured.update(_flatten_match_values(getattr(obj, 'id', None)))
+    price = None
+    for attr in ('price', 'cost', 'price_rub'):
+        if hasattr(fields, attr):
+            try:
+                price = float(getattr(fields, attr))
+                break
+            except Exception:
+                pass
+    if price is None and raw.get('price') not in (None, ''):
+        price = _as_float(raw.get('price'), 0.0)
+    amount_val = getattr(fields, 'amount', None)
+    if amount_val in (None, ''):
+        amount_val = raw.get('amount')
+    amount = _as_int(amount_val, -1) if amount_val not in (None, '') else None
+    active = getattr(fields, 'active', None)
+    entry = {
+        'texts': texts,
+        'summaries': summaries,
+        'structured': {x for x in structured if x and len(x) >= 1},
+        'price': price,
+        'amount': amount,
+        'active': bool(active) if active is not None else None,
+        'node_id': _lot_subcategory_id(fields),
+        'ts': time.time(),
+    }
+    with _LOT_FIELDS_CACHE_LOCK:
+        _LOT_FIELDS_CACHE[lid] = entry
+
+def _lot_fields_cached(lot_id, max_age=None):
+    try:
+        lid = int(lot_id)
+    except Exception:
+        return None
+    ttl = _LOT_FIELDS_CACHE_TTL if max_age is None else float(max_age)
+    with _LOT_FIELDS_CACHE_LOCK:
+        entry = _LOT_FIELDS_CACHE.get(lid)
+        if entry and (ttl <= 0 or time.time() - entry.get('ts', 0) <= ttl):
+            return entry
+    return None
+
 def _get_lot_fields_ready(account, lot_id):
     _funpay_lot_rate_guard()
     try:
-        return account.get_lot_fields(int(lot_id))
+        fields = account.get_lot_fields(int(lot_id))
+        _cache_lot_fields(lot_id, fields)
+        return fields
     except Exception as e:
         if _funpay_lot_observe_error(e):
             raise
@@ -2622,7 +3245,9 @@ def _get_lot_fields_ready(account, lot_id):
             raise
         _ensure_funpay_account_loaded(account, force=True)
         try:
-            return account.get_lot_fields(int(lot_id))
+            fields = account.get_lot_fields(int(lot_id))
+            _cache_lot_fields(lot_id, fields)
+            return fields
         except Exception as second:
             _funpay_lot_observe_error(second)
             raise
@@ -3249,43 +3874,50 @@ def _order_text_candidates(order, event=None, extra_text=''):
             result.append(value)
     return result
 
-def _funpay_lot_text(cardinal, lot_id):
-    texts = []
+def _funpay_lot_text(cardinal, lot_id, *, allow_fetch=True):
+    cached = _lot_fields_cached(lot_id)
+    if cached is not None:
+        return list(cached.get('texts') or [])
+    if not allow_fetch or cardinal is None or getattr(cardinal, 'account', None) is None:
+        return []
     try:
         fields = _get_lot_fields_ready(cardinal.account, lot_id)
     except Exception:
         fields = None
+    cached = _lot_fields_cached(lot_id, max_age=0)
+    if cached is not None:
+        return list(cached.get('texts') or [])
+    texts = []
     if fields is not None:
         for attr in ('title', 'description', 'summary', 'name'):
             value = getattr(fields, attr, None)
             if value:
-                texts.append(str(value))
-        raw = _lot_raw_fields(fields) or {}
-        for key, value in raw.items():
-            lk = str(key).lower()
-            if not value:
-                continue
-            if any(token in lk for token in ('summary', 'desc', 'title', 'type', 'game', 'platform', 'edition', 'region')):
-                texts.append(str(value))
-            elif isinstance(value, str) and len(value) <= 120 and not any(token in lk for token in ('csrf', 'token', 'password', 'payment_msg')):
+                texts.append(str(value).strip())
+    return [t for t in dict.fromkeys(texts) if t]
 
-                texts.append(value)
-    result = []
-    for value in texts:
-        value = str(value).strip()
-        if value and value not in result:
-            result.append(value)
-    return result
+def _funpay_lot_summaries(cardinal, lot_id, *, allow_fetch=True):
+    cached = _lot_fields_cached(lot_id)
+    if cached is None and allow_fetch and cardinal is not None and getattr(cardinal, 'account', None) is not None:
+        try:
+            _get_lot_fields_ready(cardinal.account, lot_id)
+        except Exception:
+            pass
+        cached = _lot_fields_cached(lot_id, max_age=0)
+    if cached is not None:
+        return list(cached.get('summaries') or [])
+    return []
 
-def _lot_match_score(cardinal, item, normalized_blob):
+def _lot_match_score(cardinal, item, normalized_blob, *, allow_fetch=True):
     if not normalized_blob:
         return 0
     product = _normalize_order_text(item.get('product_name'))
     score = 0
     if product and len(product) >= 3 and product in normalized_blob:
         score += 60 + min(20, len(product.split()) * 4)
+    summaries = {_normalize_order_text(s) for s in _funpay_lot_summaries(cardinal, item['lot_id'], allow_fetch=allow_fetch)}
+    summaries.discard('')
     seen = set()
-    for text in _funpay_lot_text(cardinal, item['lot_id']):
+    for text in _funpay_lot_text(cardinal, item['lot_id'], allow_fetch=allow_fetch):
         norm = _normalize_order_text(text)
         if not norm or norm in seen or len(norm) < 3:
             continue
@@ -3293,7 +3925,10 @@ def _lot_match_score(cardinal, item, normalized_blob):
         if norm == product:
             continue
         if norm in normalized_blob:
-            score += 35 + min(25, len(norm.split()) * 5)
+            if norm in summaries and len(norm) >= 6:
+                score += 75 + min(25, len(norm.split()) * 5)
+            else:
+                score += 35 + min(25, len(norm.split()) * 5)
             continue
         tokens = [x for x in norm.split() if len(x) >= 3]
         if tokens:
@@ -3438,44 +4073,43 @@ def _order_structured_values(order, event=None):
                 result.update(_flatten_match_values(_order_field(child, 'id')))
     return {x for x in result if x and len(x) >= 1}
 
-def _lot_structured_values(cardinal, lot_id):
-    result = set()
-    try:
-        fields = _get_lot_fields_ready(cardinal.account, int(lot_id))
-    except Exception:
-        fields = None
-    if fields is None:
-        return result
-    raw = _lot_raw_fields(fields) or {}
-    ignored = ('csrf', 'token', 'payment_msg', 'desc', 'summary', 'images', 'secrets', 'active', 'deleted', 'price', 'amount', 'offer_id')
-    for key, value in raw.items():
-        low = str(key).lower()
-        if any(part in low for part in ignored):
-            continue
-        result.update(_flatten_match_values(key))
-        result.update(_flatten_match_values(value))
-    for attr in ('server', 'side'):
-        obj = getattr(fields, attr, None)
-        if obj is not None:
-            result.update(_flatten_match_values(getattr(obj, 'name', None)))
-            result.update(_flatten_match_values(getattr(obj, 'id', None)))
-    return {x for x in result if x and len(x) >= 1}
+def _lot_structured_values(cardinal, lot_id, *, allow_fetch=True):
+    cached = _lot_fields_cached(lot_id)
+    if cached is None and allow_fetch and cardinal is not None and getattr(cardinal, 'account', None) is not None:
+        try:
+            _get_lot_fields_ready(cardinal.account, int(lot_id))
+        except Exception:
+            pass
+        cached = _lot_fields_cached(lot_id, max_age=0)
+    if cached is not None:
+        return set(cached.get('structured') or ())
+    return set()
+
+def _cached_or_saved_lot_price(cardinal, item, *, allow_fetch=False):
+    lot_id = int(item['lot_id'])
+    cached = _lot_fields_cached(lot_id)
+    if cached is not None and cached.get('price') is not None and float(cached['price']) > 0:
+        return round(float(cached['price']), 2)
+    saved = _as_float(item.get('last_funpay_price'), 0.0)
+    if saved > 0 and not allow_fetch:
+        return round(saved, 2)
+    if allow_fetch and cardinal is not None:
+        live = _as_float(_get_lot_price(cardinal, lot_id), 0.0)
+        if live > 0:
+            return round(live, 2)
+    return round(saved, 2) if saved > 0 else 0.0
 
 def _unique_configured_lot_by_order_details(cardinal, order, event, candidates):
     candidates = list(candidates or [])
     if len(candidates) <= 1:
         return candidates[0] if candidates else None
 
+    allow_fetch = len(candidates) <= 12
     prices = _order_price_candidates(order, event)
     price_diag = []
     live_prices = {}
     for item in candidates:
-        expected = 0.0
-        if cardinal is not None:
-            expected = _as_float(_get_lot_price(cardinal, item['lot_id']), 0.0)
-        if expected <= 0:
-            expected = _as_float(item.get('last_funpay_price'), 0.0)
-        expected = round(expected, 2) if expected > 0 else 0.0
+        expected = _cached_or_saved_lot_price(cardinal, item, allow_fetch=allow_fetch)
         live_prices[int(item['lot_id'])] = expected
         price_diag.append((int(item['lot_id']), expected))
 
@@ -3501,7 +4135,7 @@ def _unique_configured_lot_by_order_details(cardinal, order, event, candidates):
     if cardinal is not None and order_values and len(candidates) > 1:
         scored = []
         for item in candidates:
-            lot_values = _lot_structured_values(cardinal, item['lot_id'])
+            lot_values = _lot_structured_values(cardinal, item['lot_id'], allow_fetch=len(candidates) <= 10)
             common = order_values & lot_values
             score = sum(1 + min(8, len(v)) for v in common if len(v) >= 2)
             scored.append((score, int(item['lot_id']), item, sorted(common)[:8]))
@@ -3579,28 +4213,28 @@ def _lot_by_event(cfg, order, event, cardinal=None, extra_text=''):
                     candidate['lot_id'], candidate.get('product_name') or '')
         return candidate
 
-    candidates = product_matches if product_matches else configured
-    if len(candidates) > 1:
-        resolved = _unique_configured_lot_by_order_details(cardinal, order, event, candidates)
+    if len(product_matches) > 1:
+        resolved = _unique_configured_lot_by_order_details(cardinal, order, event, product_matches)
         if resolved is not None:
             return resolved
-        if product_matches:
-            logger.warning(
-                'Rental LOT не выбран: одинаковый товар настроен в нескольких LOT и точного признака заказа недостаточно · lots=%s',
-                [(int(x.get('lot_id') or 0), _provider_id(x), _as_float(x.get('last_funpay_price'), 0.0)) for x in candidates]
-            )
-            logger.info(
-                'Rental LOT match debug · configured=%s · product_matches=%s · order_prices=%s · text=%s',
-                [(int(x.get('lot_id') or 0), str(x.get('product_name') or '')) for x in configured],
-                [int(x.get('lot_id') or 0) for x in product_matches],
-                _order_price_candidates(order, event),
-                _compact_error(normalized_blob, 220)
-            )
-            return None
+        logger.warning(
+            'Rental LOT не выбран: одинаковый товар настроен в нескольких LOT и точного признака заказа недостаточно · lots=%s',
+            [(int(x.get('lot_id') or 0), _provider_id(x), _as_float(x.get('last_funpay_price'), 0.0)) for x in product_matches]
+        )
+        logger.info(
+            'Rental LOT match debug · configured=%s · product_matches=%s · order_prices=%s · text=%s',
+            [(int(x.get('lot_id') or 0), str(x.get('product_name') or '')) for x in configured[:12]],
+            [int(x.get('lot_id') or 0) for x in product_matches],
+            _order_price_candidates(order, event),
+            _compact_error(normalized_blob, 220)
+        )
+        return None
+
     if cardinal is not None:
+        allow_fetch = len(configured) <= 10
         scored = []
-        for item in candidates:
-            score = _lot_match_score(cardinal, item, normalized_blob)
+        for item in configured:
+            score = _lot_match_score(cardinal, item, normalized_blob, allow_fetch=allow_fetch)
             if score > 0:
                 scored.append((score, int(item['lot_id']), item))
         scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
@@ -3611,16 +4245,20 @@ def _lot_by_event(cfg, order, event, cardinal=None, extra_text=''):
                 logger.info('LOT %s сопоставлен по полям настроенного LOT · score=%s',
                             candidate['lot_id'], best_score)
                 return candidate
+            top_group = [row[2] for row in scored if row[0] >= 60 and row[0] == best_score]
+            if len(top_group) > 1:
+                resolved = _unique_configured_lot_by_order_details(cardinal, order, event, top_group)
+                if resolved is not None:
+                    return resolved
             logger.warning(
                 'Rental LOT не выбран: неоднозначность между настроенными LOT · scores=%s',
                 [(row[1], row[0]) for row in scored[:5]]
             )
 
-    logger.info(
-        'Rental LOT match debug · configured=%s · product_matches=%s · text=%s',
-        [(int(x.get('lot_id') or 0), str(x.get('product_name') or '')) for x in configured],
-        [int(x.get('lot_id') or 0) for x in product_matches],
-        _compact_error(normalized_blob, 220)
+    logger.debug(
+        'Rental LOT match debug · configured=%s · product_matches=[] · text=%s',
+        len(configured),
+        _compact_error(normalized_blob, 180)
     )
     return None
 
@@ -3714,18 +4352,66 @@ def _rent_success_message(cfg, record, credentials):
 def _norm_username(value):
     return str(value or '').strip().lower().lstrip('@')
 
+def _is_numeric_chat_id(value):
+    s = str(value or '').strip()
+    return bool(s and s.isdigit())
+
+def _users_node_pair(chat_id):
+    m = re.fullmatch(r'users-(\d+)-(\d+)', str(chat_id or '').strip(), re.I)
+    if not m:
+        return None
+    return {m.group(1), m.group(2)}
+
+def _find_chat_by_buyer_name(cardinal, buyer_username, *, allow_network=True):
+    raw_buyer = str(buyer_username or '').strip()
+    norm_buyer = _norm_username(raw_buyer)
+    account = getattr(cardinal, 'account', None) if cardinal is not None else None
+    if not norm_buyer or account is None:
+        return None
+    chats_map = getattr(account, 'chats', None)
+    if isinstance(chats_map, dict):
+        for chat in list(chats_map.values()):
+            cname = _norm_username(getattr(chat, 'name', None))
+            if cname and cname == norm_buyer and getattr(chat, 'id', None) not in (None, ''):
+                return chat
+    finder = getattr(account, 'get_chat_by_name', None)
+    if callable(finder):
+        for make_req in ((False, True) if allow_network else (False,)):
+            try:
+                chat = finder(raw_buyer, make_req)
+                if chat and getattr(chat, 'id', None) not in (None, ''):
+                    return chat
+            except Exception:
+                pass
+    return None
+
 def _record_chat_aliases(record):
     aliases = set()
-    if record.get('chat_id') not in (None, ''):
-        aliases.add(str(record.get('chat_id')))
-    raw = record.get('chat_aliases') or []
+    for key in ('chat_id', 'delivery_chat_id'):
+        val = (record or {}).get(key)
+        if val not in (None, ''):
+            aliases.add(str(val))
+    raw = (record or {}).get('chat_aliases') or []
     if isinstance(raw, (list, tuple, set)):
         for value in raw:
             if value not in (None, ''):
                 aliases.add(str(value))
     return aliases
 
-def _remember_rental_contact(order_id, chat_id=None, buyer_username=''):
+def _preferred_delivery_chat(current, candidate):
+    cur = str(current or '').strip()
+    cand = str(candidate or '').strip()
+    if not cand:
+        return cur
+    if not cur:
+        return cand
+    if _is_numeric_chat_id(cand):
+        return cand
+    if _is_numeric_chat_id(cur):
+        return cur
+    return cand
+
+def _remember_rental_contact(order_id, chat_id=None, buyer_username='', buyer_id=None):
     rec = _rental_get(order_id)
     if not rec:
         return None
@@ -3734,21 +4420,34 @@ def _remember_rental_contact(order_id, chat_id=None, buyer_username=''):
         aliases.add(str(chat_id))
     if buyer_username:
         rec['buyer_username'] = str(buyer_username).strip()
+    if buyer_id not in (None, '', 0):
+        rec['buyer_id'] = str(buyer_id).strip()
     rec['chat_aliases'] = sorted(aliases)
-
     if chat_id not in (None, ''):
-        rec['delivery_chat_id'] = str(chat_id)
+        rec['delivery_chat_id'] = _preferred_delivery_chat(rec.get('delivery_chat_id') or rec.get('chat_id'), chat_id)
     return _rental_save(rec)
 
-def _record_belongs_to_buyer(record, chat_id=None, author=''):
+def _record_belongs_to_buyer(record, chat_id=None, author='', author_id=None, chat_name=''):
     if not record:
         return False
     if chat_id not in (None, '') and str(chat_id) in _record_chat_aliases(record):
         return True
+    rec_buyer_id = str(record.get('buyer_id') or '').strip()
+    if author_id not in (None, '', 0) and rec_buyer_id and str(author_id).strip() == rec_buyer_id:
+        _remember_rental_contact(record.get('order_id'), chat_id, author, author_id)
+        return True
+    if author_id not in (None, '', 0):
+        aid = str(author_id).strip()
+        for alias in _record_chat_aliases(record):
+            pair = _users_node_pair(alias)
+            if pair and aid in pair:
+                _remember_rental_contact(record.get('order_id'), chat_id, author, author_id)
+                return True
     buyer = _norm_username(record.get('buyer_username'))
     who = _norm_username(author)
-    if buyer and who and buyer == who:
-        _remember_rental_contact(record.get('order_id'), chat_id, author)
+    cname = _norm_username(chat_name)
+    if buyer and who and buyer == who and (not cname or cname == buyer):
+        _remember_rental_contact(record.get('order_id'), chat_id, author, author_id)
         return True
     return False
 
@@ -3757,26 +4456,24 @@ def _repair_rental_contact(cardinal, record, preferred_chat_id=None):
         return record
     full = _resolve_full_order(cardinal, record.get('order_id'), None)
     buyer = str(_order_field(full, 'buyer_username') or record.get('buyer_username') or '').strip()
+    buyer_id = str(_order_field(full, 'buyer_id') or record.get('buyer_id') or '').strip()
     aliases = _record_chat_aliases(record)
     full_chat = _order_field(full, 'chat_id')
     if full_chat not in (None, ''):
         aliases.add(str(full_chat))
     if preferred_chat_id not in (None, ''):
         aliases.add(str(preferred_chat_id))
-    if buyer and getattr(cardinal, 'account', None):
-        getter = getattr(cardinal.account, 'get_chat_by_name', None)
-        if callable(getter):
-            try:
-                chat = getter(buyer, True)
-                if chat and getattr(chat, 'id', None) is not None:
-                    aliases.add(str(chat.id))
-                    preferred_chat_id = chat.id
-            except Exception:
-                pass
+    resolved_chat = _find_chat_by_buyer_name(cardinal, buyer, allow_network=True)
+    if resolved_chat and getattr(resolved_chat, 'id', None) not in (None, ''):
+        aliases.add(str(resolved_chat.id))
+        preferred_chat_id = _preferred_delivery_chat(preferred_chat_id, resolved_chat.id)
     record['buyer_username'] = buyer
+    if buyer_id:
+        record['buyer_id'] = buyer_id
     record['chat_aliases'] = sorted(aliases)
-    if preferred_chat_id not in (None, ''):
-        record['delivery_chat_id'] = str(preferred_chat_id)
+    best_delivery = _preferred_delivery_chat(record.get('delivery_chat_id') or record.get('chat_id'), preferred_chat_id)
+    if best_delivery:
+        record['delivery_chat_id'] = best_delivery
     return _rental_save(record)
 
 def _credentials_delivery_worker(cardinal, order_id, max_wait_sec=600):
@@ -3784,22 +4481,30 @@ def _credentials_delivery_worker(cardinal, order_id, max_wait_sec=600):
     last_error = ''
     while time.time() - started < max_wait_sec:
         rec = _rental_get(order_id)
-        if not rec or not rec.get('rental_id'):
+        if not rec or not rec.get('rental_id') or rec.get('payment_blocked') or str(rec.get('status') or '').lower() == 'refunded':
             return False
         if rec.get('credentials_delivered'):
             return True
-        paid_order = _verified_paid_order(cardinal, order_id,
-                                          expected_buyer=rec.get('buyer_username') or '')
+        paid_order, pay_reason = _verified_paid_order_status(
+            cardinal, order_id, expected_buyer=rec.get('buyer_username') or ''
+        )
         if paid_order is None:
+            if pay_reason == 'terminal':
+                rec['credentials_pending'] = False
+                rec['payment_blocked'] = True
+                _rental_save(rec)
             return False
-        paid_chat = _paid_order_chat(cardinal, paid_order)
+        paid_chat = _paid_order_chat(cardinal, paid_order, preferred_chat_id=rec.get('delivery_chat_id') or rec.get('chat_id'))
         if not paid_chat:
             return False
-        rec['delivery_chat_id'] = str(paid_chat)
+        rec['delivery_chat_id'] = _preferred_delivery_chat(rec.get('delivery_chat_id'), paid_chat)
+        rec['chat_aliases'] = sorted(_record_chat_aliases(rec) | {str(paid_chat)})
+        if _order_field(paid_order, 'buyer_id') not in (None, '', 0):
+            rec['buyer_id'] = str(_order_field(paid_order, 'buyer_id'))
         _rental_save(rec)
         if _as_int(rec.get('credentials_next_retry_ts'), 0) > _now():
             return False
-        rec = _repair_rental_contact(cardinal, rec) or rec
+        rec = _repair_rental_contact(cardinal, rec, preferred_chat_id=paid_chat) or rec
         cfg = _cfg_for_record(rec, _owner_cfg(rec.get('owner_key') or rec.get('chat_id')))
         rec_cfg = _cfg_for_record(rec, cfg)
         try:
@@ -3807,13 +4512,17 @@ def _credentials_delivery_worker(cardinal, order_id, max_wait_sec=600):
             login, password = _credentials_values(data)
             if login and password:
                 rec['account_login'] = login
-                target_chat = _paid_order_chat(cardinal, paid_order)
+                target_chat = _paid_order_chat(cardinal, paid_order, preferred_chat_id=rec.get('delivery_chat_id') or rec.get('chat_id'))
                 if not target_chat:
                     last_error = 'Не удалось подтвердить чат покупателя для отправки.'
                 else:
-                    rec['delivery_chat_id'] = str(target_chat)
+                    rec['delivery_chat_id'] = _preferred_delivery_chat(rec.get('delivery_chat_id'), target_chat)
                     sent = _safe_send(cardinal, target_chat, _rent_success_message(cfg, rec, data))
                     if sent is not None and sent is not False:
+                        sent_cid = _order_field(sent, 'chat_id')
+                        if sent_cid not in (None, ''):
+                            rec['chat_aliases'] = sorted(_record_chat_aliases(rec) | {str(target_chat), str(sent_cid)})
+                            rec['delivery_chat_id'] = _preferred_delivery_chat(rec.get('delivery_chat_id'), sent_cid)
                         rec['credentials_pending'] = False
                         rec['credentials_delivered'] = True
                         rec['credentials_delivered_ts'] = _now()
@@ -3898,31 +4607,31 @@ def _process_rental_order(cardinal, event, lot, cfg, order_id, chat_id, buyer_us
                           'Заказ #%s · аренда НЕ запущена: нет подтверждённой оплаты; причина %s.',
                           level='warning')
         return None
-    verified_chat = _paid_order_chat(cardinal, verified)
+    verified_chat = _paid_order_chat(cardinal, verified, preferred_chat_id=chat_id)
     if verified_chat in (None, ''):
         _payment_log_once(order_id, 'CHAT_NOT_FOUND',
                           'Заказ #%s · аренда НЕ запущена: чат покупателя не установлен (%s).')
         return None
+    raw_order_chat = _order_field(verified, 'chat_id')
     if str(verified_chat) != str(chat_id or ''):
         logger.info('Заказ #%s · чат заказа обновился: %s -> %s', order_id, chat_id, verified_chat)
         chat_id = verified_chat
     buyer_username = str(_order_field(verified, 'buyer_username') or buyer_username or '').strip()
+    buyer_id = str(_order_field(verified, 'buyer_id') or '').strip()
     existing = _rental_get(order_id)
     if existing and existing.get('rental_id'):
-
-
         if _as_int(existing.get('lot_id'), 0) != _as_int(lot.get('lot_id'), 0):
             logger.warning('Заказ #%s · LOT сохранённой аренды не совпадает с текущим.', order_id)
             return None
-        existing = _remember_rental_contact(order_id, chat_id, buyer_username) or existing
+        existing = _remember_rental_contact(order_id, chat_id, buyer_username, buyer_id) or existing
+        if raw_order_chat not in (None, ''):
+            existing = _remember_rental_contact(order_id, raw_order_chat, buyer_username, buyer_id) or existing
         if str(existing.get('status')) in {'active', 'completed', 'retry', 'creating'} and not existing.get('credentials_delivered'):
             _schedule(f'credentials:{order_id}', _credentials_delivery_worker, cardinal, order_id)
         return existing
     trusted_purchase = (_event_text(event) if event is not None and _system_purchase_message(event)
                         and (m := _PAID_ORDER_RE.search(_event_text(event)))
                         and m.group(1).upper() == str(order_id).upper() else '')
-
-
 
     prior_verified = bool(existing and existing.get('lot_id') == lot.get('lot_id')
                           and existing.get('order_id') == str(order_id)
@@ -3936,9 +4645,10 @@ def _process_rental_order(cardinal, event, lot, cfg, order_id, chat_id, buyer_us
             logger.warning('Заказ #%s · аренда НЕ запущена: оплаченный LOT не совпадает с настройками.', order_id)
             return None
     cfg = _cfg_for_record(existing, cfg) if existing else _provider_cfg(cfg, _provider_id(lot))
-    aliases = []
-    if chat_id not in (None, ''):
-        aliases.append(str(chat_id))
+    aliases = set()
+    for cid in (chat_id, raw_order_chat, _event_chat_id(event)):
+        if cid not in (None, ''):
+            aliases.add(str(cid))
     record = existing or {
         'order_id': str(order_id),
         'provider': _provider_id(cfg),
@@ -3947,8 +4657,9 @@ def _process_rental_order(cardinal, event, lot, cfg, order_id, chat_id, buyer_us
         'review_gift_min_stars': int(cfg.get('review_gift_min_stars') or 5),
         'chat_id': str(chat_id or ''),
         'delivery_chat_id': str(chat_id or ''),
-        'chat_aliases': aliases,
+        'chat_aliases': sorted(aliases),
         'buyer_username': str(buyer_username or '').strip(),
+        'buyer_id': buyer_id,
         'lot_id': int(lot['lot_id']),
         'product_id': int(lot['product_id']),
         'product_name': str(lot.get('product_name') or ''),
@@ -3961,10 +4672,12 @@ def _process_rental_order(cardinal, event, lot, cfg, order_id, chat_id, buyer_us
         'attempts': 0,
     }
     if chat_id not in (None, ''):
-        record['delivery_chat_id'] = str(chat_id)
-        record['chat_aliases'] = sorted(_record_chat_aliases(record) | {str(chat_id)})
+        record['delivery_chat_id'] = _preferred_delivery_chat(record.get('delivery_chat_id'), chat_id)
+    record['chat_aliases'] = sorted(_record_chat_aliases(record) | aliases)
     if buyer_username:
         record['buyer_username'] = str(buyer_username).strip()
+    if buyer_id:
+        record['buyer_id'] = buyer_id
     record['lot_paid_verified'] = True
     record['attempts'] = _as_int(record.get('attempts'), 0) + 1
     record['status'] = 'creating'
@@ -3982,7 +4695,6 @@ def _process_rental_order(cardinal, event, lot, cfg, order_id, chat_id, buyer_us
             )
         record.update({
             'rental_id': rental_id,
-
             'rental_id_verified': False,
             'owner_key': str(_owner_key_for_cfg(cfg) or record.get('owner_key') or ''),
             'api_key_fp': _api_key_fp(cfg),
@@ -4016,11 +4728,16 @@ def _process_rental_order(cardinal, event, lot, cfg, order_id, chat_id, buyer_us
             _rental_save(record)
 
             still_paid = _verified_paid_order(cardinal, order_id, expected_buyer=buyer_username)
-            delivery_chat = _paid_order_chat(cardinal, still_paid) if still_paid else None
+            delivery_chat = _paid_order_chat(cardinal, still_paid, preferred_chat_id=record.get('delivery_chat_id') or chat_id) if still_paid else None
             sent = (_safe_send(cardinal, delivery_chat, _rent_success_message(cfg, record, credentials))
                     if delivery_chat else None)
             if sent is not None and sent is not False:
-                record['delivery_chat_id'] = str(delivery_chat)
+                sent_cid = _order_field(sent, 'chat_id')
+                extra_aliases = {str(delivery_chat)}
+                if sent_cid not in (None, ''):
+                    extra_aliases.add(str(sent_cid))
+                record['chat_aliases'] = sorted(_record_chat_aliases(record) | extra_aliases)
+                record['delivery_chat_id'] = _preferred_delivery_chat(delivery_chat, sent_cid)
                 record['credentials_pending'] = False
                 record['credentials_delivered'] = True
                 record['credentials_delivered_ts'] = _now()
@@ -4109,10 +4826,12 @@ def _process_rental_order(cardinal, event, lot, cfg, order_id, chat_id, buyer_us
 
 def _process_extension_order(cardinal, event, ext, order_id, chat_id):
     verified = _verified_paid_order(cardinal, order_id)
+    event_chat_name = _event_chat_name(event) if event is not None else ''
     if (verified is None or not _paid_extension_match(verified, ext)
-            or str(_paid_order_chat(cardinal, verified) or '') != str(chat_id or '')):
+            or not _order_matches_event_chat(cardinal, verified, chat_id, chat_name=event_chat_name)):
         logger.warning('Заказ #%s · продление НЕ запущено: нет оплаты/совпадения LOT/чата.', order_id)
         return
+    delivery_chat = _paid_order_chat(cardinal, verified, preferred_chat_id=chat_id) or chat_id
 
     route = _extension_purchase_get(order_id)
     if route and route.get('status') == 'completed':
@@ -4150,7 +4869,7 @@ def _process_extension_order(cardinal, event, ext, order_id, chat_id):
             order_id, ext, status='completed',
             ends_at=ends_at or '', completed_ts=_now()
         )
-        _safe_send(cardinal, chat_id, _tpl(
+        _safe_send(cardinal, delivery_chat, _tpl(
             cfg, 'extend_success', game=ext.get('product_name') or 'Steam',
             duration=_format_duration(ext['duration_hours']), ends_at=_fmt_dt(ends_at),
             order_id=ext.get('order_id'), rental_id=ext.get('rental_id')
@@ -4209,10 +4928,26 @@ def _record_locally_current(rec):
         return False
     return bool(rec.get('rental_id'))
 
-def _active_rentals_for_chat(chat_id):
+def _event_author_id(event):
+    message = _order_field(event, 'message')
+    return _order_field(message, 'author_id') or _order_field(event, 'author_id')
+
+def _event_chat_name(event):
+    message = _order_field(event, 'message')
+    chat = _order_field(event, 'chat')
+    return str(
+        _order_field(message, 'chat_name')
+        or _order_field(event, 'chat_name')
+        or _order_field(chat, 'name')
+        or ''
+    ).strip()
+
+def _active_rentals_for_chat(chat_id, author='', author_id=None, chat_name=''):
     rows = []
     for rec in _rental_list(active_only=False):
-        if str(rec.get('chat_id')) != str(chat_id):
+        if rec.get('payment_blocked') or str(rec.get('status') or '').lower() == 'refunded':
+            continue
+        if not _record_belongs_to_buyer(rec, chat_id, author, author_id=author_id, chat_name=chat_name):
             continue
         if not _record_locally_current(rec):
             if str(rec.get('status') or '').lower() in {'active', 'completed', 'running', 'rented'}:
@@ -4224,11 +4959,38 @@ def _active_rentals_for_chat(chat_id):
         rows.append(rec)
     return rows
 
-def _refresh_rental_current(cfg, rec):
+def _buyer_has_any_rental(chat_id, author='', author_id=None, chat_name=''):
+    for rec in _rental_list(active_only=False):
+        if _record_belongs_to_buyer(rec, chat_id, author, author_id=author_id, chat_name=chat_name):
+            return True
+    return False
+
+def _active_rentals_for_buyer(cardinal, chat_id, author='', author_id=None, chat_name=''):
+    out = []
+    for rec in _active_rentals_for_chat(chat_id, author=author, author_id=author_id, chat_name=chat_name):
+        if cardinal is not None and not _paid_rental_access(
+            cardinal, rec, chat_id, author, author_id=author_id, chat_name=chat_name
+        ):
+            continue
+        cfg = _cfg_for_record(rec, _owner_cfg(rec.get('owner_key') or rec.get('chat_id') or chat_id))
+        refreshed = _refresh_rental_current(cfg, rec, max_age=60)
+        if not refreshed:
+            continue
+        _remember_rental_contact(refreshed.get('order_id'), chat_id, author, author_id)
+        out.append(refreshed)
+    return out
+
+def _refresh_rental_current(cfg, rec, max_age=0):
     if not rec:
+        return None
+    if rec.get('payment_blocked') or str(rec.get('status') or '').lower() == 'refunded':
         return None
     if not rec.get('rental_id'):
         return rec if _record_locally_current(rec) else None
+    if max_age > 0 and _record_locally_current(rec):
+        last_chk = _as_int(rec.get('last_status_check_ts'), 0)
+        if last_chk and (_now() - last_chk) < int(max_age):
+            return rec
     rid = rec.get('rental_id')
     last_not_found = None
     for owner_key, candidate_cfg, fp in _cfg_candidates_for_record(rec, cfg):
@@ -4243,6 +5005,7 @@ def _refresh_rental_current(cfg, rec):
                 rec['rental_id_verified'] = True
                 rec['rental_id_verified_by'] = 'status'
                 rec['api_inconsistent'] = False
+                rec['last_status_check_ts'] = _now()
                 _rental_save(rec)
 
                 if api_status in {'active', 'running', 'rented', 'creating'}:
@@ -4280,76 +5043,137 @@ def _ensure_record_login(cfg, rec):
     except Exception:
         return ''
 
-def _select_rental_by_order(chat_id, order_hint, author='', cardinal=None):
+def _select_rental_by_order(chat_id, order_hint, author='', cardinal=None, *, author_id=None, chat_name=''):
     clean = str(order_hint or '').strip().lstrip('#').rstrip('.,;:!?')
     if not clean:
         return None
     rec = _rental_get(clean)
     if not rec:
+        low = clean.casefold()
+        for row in _rental_list(active_only=False):
+            if str(row.get('order_id') or '').casefold() == low:
+                rec = row
+                break
+    if not rec:
         logger.info('Команда для заказа #%s: запись отсутствует в rentals.json.', clean)
         return None
-    if cardinal is not None and not _paid_rental_access(cardinal, rec, chat_id, author):
+    if cardinal is not None and not _paid_rental_access(
+        cardinal, rec, chat_id, author, author_id=author_id, chat_name=chat_name
+    ):
         return None
-    if not _record_belongs_to_buyer(rec, chat_id, author):
+    if not _record_belongs_to_buyer(rec, chat_id, author, author_id=author_id, chat_name=chat_name):
         if cardinal is None:
             return None
         rec = _repair_rental_contact(cardinal, rec, preferred_chat_id=chat_id) or rec
-        if not _record_belongs_to_buyer(rec, chat_id, author):
+        if not _record_belongs_to_buyer(rec, chat_id, author, author_id=author_id, chat_name=chat_name):
             return None
     cfg = _cfg_for_record(rec, _owner_cfg(rec.get('owner_key') or rec.get('chat_id') or chat_id))
-    rec = _refresh_rental_current(cfg, rec)
+    rec = _refresh_rental_current(cfg, rec, max_age=60)
     if not rec:
         return None
-    _remember_rental_contact(rec.get('order_id'), chat_id, author)
+    _remember_rental_contact(rec.get('order_id'), chat_id, author, author_id)
     return rec
 
-def _select_rental_by_login(chat_id, login_hint, author='', cardinal=None):
+def _select_rental_by_login(chat_id, login_hint, author='', cardinal=None, *, author_id=None, chat_name=''):
     clean = str(login_hint or '').strip().rstrip('.,;:!?')
     if not clean:
         return None
     for rec in _rental_list(active_only=False):
         if not rec.get('rental_id') or not _record_locally_current(rec):
             continue
+        if rec.get('payment_blocked') or str(rec.get('status') or '').lower() == 'refunded':
+            continue
         saved_login = str(rec.get('account_login') or '').strip()
         if saved_login and saved_login.casefold() != clean.casefold():
             continue
 
-        if cardinal is not None and not _paid_rental_access(cardinal, rec, chat_id, author):
+        if cardinal is not None and not _paid_rental_access(
+            cardinal, rec, chat_id, author, author_id=author_id, chat_name=chat_name
+        ):
             continue
-        if not _record_belongs_to_buyer(rec, chat_id, author):
+        if not _record_belongs_to_buyer(rec, chat_id, author, author_id=author_id, chat_name=chat_name):
             if cardinal is None:
                 continue
             rec = _repair_rental_contact(cardinal, rec, preferred_chat_id=chat_id) or rec
-            if not _record_belongs_to_buyer(rec, chat_id, author):
+            if not _record_belongs_to_buyer(rec, chat_id, author, author_id=author_id, chat_name=chat_name):
                 continue
         cfg = _cfg_for_record(rec, _owner_cfg(rec.get('owner_key') or rec.get('chat_id') or chat_id))
         rec_cfg = _cfg_for_record(rec, cfg)
-        rec = _refresh_rental_current(rec_cfg, rec)
+        rec = _refresh_rental_current(rec_cfg, rec, max_age=60)
         if not rec:
             continue
         login = saved_login or _ensure_record_login(rec_cfg, rec)
         if not login or login.casefold() != clean.casefold():
             continue
-        _remember_rental_contact(rec.get('order_id'), chat_id, author)
+        _remember_rental_contact(rec.get('order_id'), chat_id, author, author_id)
         return rec
     return None
 
-def _select_rental_order_or_login(chat_id, hint, author='', cardinal=None):
-    return _select_rental_by_order(chat_id, hint, author, cardinal) or _select_rental_by_login(chat_id, hint, author, cardinal)
+def _select_rental_order_or_login(chat_id, hint, author='', cardinal=None, *, author_id=None, chat_name=''):
+    return (
+        _select_rental_by_order(chat_id, hint, author, cardinal, author_id=author_id, chat_name=chat_name)
+        or _select_rental_by_login(chat_id, hint, author, cardinal, author_id=author_id, chat_name=chat_name)
+    )
 
-def _parse_command_target(text, base):
-    text = str(text or '').strip()
-    base = str(base or '').strip()
-    if not text.lower().startswith(base.lower()):
+def _clean_command_line(line):
+    s = str(line or '')
+    s = re.sub(r'[\u200b-\u200f\ufeff\ufe0e\ufe0f]', '', s).strip()
+    m = re.search(r'^[`"\'«»(\[\s]*(?:[^\w!/]+)?([!/].*)$', s, re.U)
+    if m:
+        s = m.group(1).strip()
+    return s.strip('`"\'«» ')
+
+def _parse_command_target(text, bases):
+    if isinstance(bases, str):
+        bases = (bases,)
+    normalized_bases = []
+    for base in bases:
+        b = str(base or '').strip().lower()
+        if not b:
+            continue
+        normalized_bases.append(b)
+        if b.startswith('!'):
+            normalized_bases.append('/' + b[1:])
+    lines = [ln for ln in str(text or '').splitlines() if ln.strip()]
+    if not lines:
         return None
-    tail = text[len(base):]
-    if not tail:
-        return ''
-    if tail[0] in {'_', '*'}:
-        return tail[1:].strip()
-    if tail[0].isspace():
-        return tail.strip()
+    for raw_line in lines:
+        cleaned = _clean_command_line(raw_line)
+        low = cleaned.lower()
+        for base in normalized_bases:
+            if not low.startswith(base):
+                continue
+            tail = cleaned[len(base):]
+            if not tail:
+                return ''
+            if tail[0] in {'_', '*', ':', '-'}:
+                return tail[1:].strip().split()[0] if tail[1:].strip() and base not in {'!продлить', '/продлить', '!продление', '/продление', '!extend', '/extend'} else tail[1:].strip()
+            if tail[0].isspace():
+                rest = tail.strip()
+                if not rest:
+                    return ''
+                if base in {'!продлить', '/продлить', '!продление', '/продление', '!extend', '/extend'}:
+                    return rest
+                return rest.split()[0]
     return None
+
+def _guard_lock_for(guard_key):
+    with _LAST_GUARD_LOCK:
+        lock = _GUARD_RENTAL_LOCKS.get(guard_key)
+        if lock is None:
+            if len(_GUARD_RENTAL_LOCKS) > 2000:
+                _GUARD_RENTAL_LOCKS.clear()
+            lock = threading.Lock()
+            _GUARD_RENTAL_LOCKS[guard_key] = lock
+        return lock
+
+def _format_active_choices(cmd_prefix, rentals, use_order=False):
+    lines = []
+    for r in rentals[:10]:
+        ident = str(r.get('order_id') or '') if use_order else (str(r.get('account_login') or '').strip() or str(r.get('order_id') or ''))
+        if ident:
+            lines.append(f'• {cmd_prefix}_{ident}')
+    return '\n'.join(lines)
 
 def _split_extend_target_and_duration(arg):
     raw = str(arg or '').strip()
@@ -4438,48 +5262,91 @@ def _buyer_command_handler(cardinal, event):
         return False
     cfg = _owner_cfg(chat_id)
     buyer_author = _event_author(event)
+    buyer_author_id = _event_author_id(event)
+    chat_name = _event_chat_name(event)
 
-    target = _parse_command_target(text, '!код')
+    def resolve_single_or_hint(target_arg, cmd_prefix, *, allow_order=True, allow_login=True, use_order_hint=False):
+        if target_arg:
+            rec = None
+            if allow_login and allow_order:
+                rec = _select_rental_by_login(
+                    chat_id, target_arg, buyer_author, cardinal, author_id=buyer_author_id, chat_name=chat_name
+                ) or _select_rental_by_order(
+                    chat_id, target_arg, buyer_author, cardinal, author_id=buyer_author_id, chat_name=chat_name
+                )
+            elif allow_order:
+                rec = _select_rental_by_order(
+                    chat_id, target_arg, buyer_author, cardinal, author_id=buyer_author_id, chat_name=chat_name
+                )
+            elif allow_login:
+                rec = _select_rental_by_login(
+                    chat_id, target_arg, buyer_author, cardinal, author_id=buyer_author_id, chat_name=chat_name
+                )
+            if rec:
+                return rec, None
+            active = _active_rentals_for_buyer(
+                cardinal, chat_id, buyer_author, author_id=buyer_author_id, chat_name=chat_name
+            )
+            if active:
+                choices = _format_active_choices(cmd_prefix, active, use_order=use_order_hint)
+                hint_msg = _tpl(cfg, 'no_active_rental') + (f'\n\nВаши активные аренды:\n{choices}' if choices else '')
+                return None, hint_msg
+            return None, _tpl(cfg, 'no_active_rental')
+        active = _active_rentals_for_buyer(
+            cardinal, chat_id, buyer_author, author_id=buyer_author_id, chat_name=chat_name
+        )
+        if len(active) == 1:
+            return active[0], None
+        if len(active) > 1:
+            choices = _format_active_choices(cmd_prefix, active, use_order=use_order_hint)
+            return None, f'У вас несколько активных аренд. Укажите нужную:\n{choices}'
+        if _buyer_has_any_rental(chat_id, buyer_author, author_id=buyer_author_id, chat_name=chat_name):
+            return None, _tpl(cfg, 'rental_expired')
+        return None, ''
+
+    target = _parse_command_target(text, ('!код', '!code', '!guard', '!гуард', '!sg'))
     if target is not None:
-        if not target:
-            _command_reply(cardinal, event, _tpl(cfg, 'bad_guard_command'))
-            return True
-        rec = _select_rental_by_login(chat_id, target, buyer_author, cardinal)
+        rec, err_reply = resolve_single_or_hint(target, '!код', allow_order=True, allow_login=True, use_order_hint=False)
         if not rec:
-            logger.info('Steam Guard: не найдена оплаченная активная аренда login=%s chat=%s.', target, chat_id)
-            _command_reply(cardinal, event, _tpl(cfg, 'no_active_rental'))
-            return True
+            if err_reply:
+                logger.info('Steam Guard: не найдена оплаченная активная аренда login=%s chat=%s.', target or '<auto>', chat_id)
+                _command_reply(cardinal, event, err_reply)
+                return True
+            return False
         rec_cfg = _cfg_for_record(rec, cfg)
-        guard_key = f'{chat_id}:{rec["rental_id"]}'
-        last = _LAST_GUARD.get(guard_key, 0)
-        wait = int(rec_cfg['guard_cooldown_sec'] - (time.time() - last))
-        if wait > 0:
-            _command_reply(cardinal, event, _tpl(cfg, 'guard_wait', seconds=wait))
-            return True
-        _LAST_GUARD[guard_key] = time.time()
-        try:
-            data = _api_guard(rec_cfg, rec['rental_id'])
-            code = str(data.get('code') or data.get('guard_code') or '').strip()
-            if not code:
-                raise RuntimeError('Провайдер не вернул Guard-код.')
-            _command_reply(cardinal, event, _tpl(rec_cfg, 'guard', code=code, game=rec.get('product_name'), order_id=rec.get('order_id')))
-            logger.info('Steam Guard: ответ обработан для заказа %s, провайдер %s.', rec.get('order_id'), _provider_id(rec_cfg))
-        except Exception as e:
-            logger.warning('Steam Guard: ошибка получения для заказа %s, провайдер %s, тип=%s, код=%s.',
-                           rec.get('order_id'), _provider_id(rec_cfg), type(e).__name__,
-                           getattr(e, 'code', '') if isinstance(e, SteamSMMError) else '')
-            _command_reply(cardinal, event, _tpl(rec_cfg, 'guard_failed', reason=_buyer_error_message(e)))
+        guard_key = f'{rec["order_id"]}:{rec["rental_id"]}'
+        lock = _guard_lock_for(guard_key)
+        with lock:
+            with _LAST_GUARD_LOCK:
+                last = _LAST_GUARD.get(guard_key, 0)
+            wait = int(rec_cfg['guard_cooldown_sec'] - (time.time() - last))
+            if wait > 0:
+                _command_reply(cardinal, event, _tpl(cfg, 'guard_wait', seconds=wait))
+                return True
+            try:
+                data = _api_guard(rec_cfg, rec['rental_id'], expected_login=str(rec.get('account_login') or ''))
+                code = str(data.get('code') or data.get('guard_code') or '').strip()
+                if not code:
+                    raise SteamSMMError('Провайдер не вернул Guard-код.', code='GUARD_UNAVAILABLE')
+                with _LAST_GUARD_LOCK:
+                    _LAST_GUARD[guard_key] = time.time()
+                _command_reply(cardinal, event, _tpl(rec_cfg, 'guard', code=code, game=rec.get('product_name'), order_id=rec.get('order_id')))
+                logger.info('Steam Guard: ответ обработан для заказа %s, провайдер %s.', rec.get('order_id'), _provider_id(rec_cfg))
+            except Exception as e:
+                logger.warning('Steam Guard: ошибка получения для заказа %s, провайдер %s, тип=%s, код=%s.',
+                               rec.get('order_id'), _provider_id(rec_cfg), type(e).__name__,
+                               getattr(e, 'code', '') if isinstance(e, SteamSMMError) else '')
+                _command_reply(cardinal, event, _tpl(rec_cfg, 'guard_failed', reason=_buyer_error_message(e)))
         return True
 
-    target = _parse_command_target(text, '!данные')
+    target = _parse_command_target(text, ('!данные', '!data'))
     if target is not None:
-        if not target:
-            _command_reply(cardinal, event, _tpl(cfg, 'bad_credentials_command'))
-            return True
-        rec = _select_rental_by_order(chat_id, target, buyer_author, cardinal)
+        rec, err_reply = resolve_single_or_hint(target, '!данные', allow_order=True, allow_login=True, use_order_hint=True)
         if not rec:
-            _command_reply(cardinal, event, _tpl(cfg, 'no_active_rental'))
-            return True
+            if err_reply:
+                _command_reply(cardinal, event, err_reply)
+                return True
+            return False
         rec_cfg = _cfg_for_record(rec, cfg)
         try:
             rec, data = _credentials_for_record(rec_cfg, rec)
@@ -4503,21 +5370,21 @@ def _buyer_command_handler(cardinal, event):
             _command_reply(cardinal, event, _tpl(rec_cfg, 'credentials_failed', reason=_buyer_error_message(e)))
         return True
 
-    target = _parse_command_target(text, '!срок')
+    target = _parse_command_target(text, ('!срок', '!время', '!time'))
     if target is not None:
-        if not target:
-            _command_reply(cardinal, event, _tpl(cfg, 'bad_status_command'))
-            return True
-        rec = _select_rental_order_or_login(chat_id, target, buyer_author, cardinal)
+        rec, err_reply = resolve_single_or_hint(target, '!срок', allow_order=True, allow_login=True, use_order_hint=True)
         if not rec:
-            _command_reply(cardinal, event, _tpl(cfg, 'no_active_rental'))
-            return True
+            if err_reply:
+                _command_reply(cardinal, event, err_reply)
+                return True
+            return False
         rec_cfg = _cfg_for_record(rec, cfg)
         try:
             data = _api_status(rec_cfg, rec['rental_id'])
             rec['status'] = str(data.get('status') or rec.get('status') or 'active')
             rec['starts_at'] = data.get('starts_at') or rec.get('starts_at')
             rec['ends_at'] = data.get('ends_at') or rec.get('ends_at')
+            rec['last_status_check_ts'] = _now()
             _rental_save(rec)
             if not _record_locally_current(rec):
                 _command_reply(cardinal, event, _tpl(rec_cfg, 'rental_expired'))
@@ -4531,26 +5398,32 @@ def _buyer_command_handler(cardinal, event):
             _command_reply(cardinal, event, _tpl(rec_cfg, 'status_failed', reason=_buyer_error_message(e)))
         return True
 
-    target = _parse_command_target(text, '!продлить')
+    target = _parse_command_target(text, ('!продлить', '!продление', '!extend'))
     if target is not None:
         if not cfg.get('extension_enabled', True):
-            _command_reply(cardinal, event, _tpl(cfg, 'extension_disabled'))
-            return True
-        if not target:
-            _command_reply(cardinal, event, _tpl(cfg, 'extend_usage'))
-            return True
+            if target or _buyer_has_any_rental(chat_id, buyer_author, author_id=buyer_author_id, chat_name=chat_name):
+                _command_reply(cardinal, event, _tpl(cfg, 'extension_disabled'))
+                return True
+            return False
         identity, hours = _split_extend_target_and_duration(target)
-        rec = _select_rental_order_or_login(chat_id, identity, buyer_author, cardinal)
+        if not identity and hours is None and target:
+            hours = _duration_from_text(target)
+            if hours is not None:
+                identity = ''
+        rec, err_reply = resolve_single_or_hint(identity, '!продлить', allow_order=True, allow_login=True, use_order_hint=True)
         if not rec:
-            _command_reply(cardinal, event, _tpl(cfg, 'no_active_rental'))
-            return True
+            if err_reply:
+                _command_reply(cardinal, event, err_reply)
+                return True
+            return False
         rec_cfg = _cfg_for_record(rec, cfg)
         rec = _refresh_rental_current(rec_cfg, rec)
         if not rec:
             _command_reply(cardinal, event, _tpl(rec_cfg, 'rental_expired'))
             return True
 
-        base = f'!продлить_{identity}'
+        eff_identity = identity or str(rec.get('order_id') or '')
+        base = f'!продлить_{eff_identity}'
         if not hours:
             _command_reply(cardinal, event, _tpl(
                 rec_cfg, 'extend_choose',
@@ -4561,9 +5434,10 @@ def _buyer_command_handler(cardinal, event):
             ))
             return True
 
+        rec_aliases = _record_chat_aliases(rec) | {str(chat_id)}
         for ext in _extension_records().values():
             if (
-                str(ext.get('chat_id')) == str(chat_id)
+                (str(ext.get('chat_id')) in rec_aliases or str(ext.get('order_id')) == str(rec.get('order_id')))
                 and str(ext.get('order_id')) == str(rec.get('order_id'))
                 and str(ext.get('status')) == 'active'
                 and (int(ext.get('expires_ts') or 0) <= 0 or int(ext.get('expires_ts') or 0) > _now())
@@ -4604,17 +5478,26 @@ def _sync_balance(cfg, owner_key):
 def _apply_lot_sync(cardinal, owner_key, cfg, products_data=None, balance_data=None, notify=True):
     if not cfg.get('api_key'):
         return {'changed': 0, 'errors': ['API key не задан']}
-    products_data = products_data or _api_products(cfg)
+    provider = _provider_id(cfg)
+    products_data = products_data or _api_products(cfg, force=True)
     balance_data = balance_data or _api_balance(cfg)
     regular_balance = _as_float(balance_data.get('regular_balance'), 0.0)
     min_balance = _as_float(cfg.get('min_balance_rub'), 0.0, 0.0)
     lots = cfg.get('lots') or []
+    if provider == 'muvsell' and lots:
+        try:
+            _muv_prefetch_quotes(cfg, lots, products_data=products_data)
+        except Exception:
+            pass
     changed = 0
     notes = []
     stock_notes = []
     price_notes = []
     lot_notes = []
     balance_blocked = False
+    account = getattr(cardinal, 'account', None) if cardinal is not None else None
+    if account is None and _CARDINAL_REF is not None:
+        account = getattr(_CARDINAL_REF, 'account', None)
     for row in lots:
         if _FUNPAY_LOT_RATE_UNTIL > time.monotonic():
             notes.append('FunPay 429: обновление оставшихся лотов отложено до снятия ограничения')
@@ -4636,19 +5519,6 @@ def _apply_lot_sync(cardinal, owner_key, cfg, products_data=None, balance_data=N
             if isinstance(prev_stock, int) and prev_stock >= 0 and new_stock >= 0 and prev_stock != new_stock:
                 stock_notes.append(f'{row["product_name"]}: в наличии {prev_stock} → {new_stock}')
 
-            if row.get('auto_stock', True) and product.get('stock_known', True) and new_stock > 0:
-                current_amount = _get_lot_amount(cardinal, lot_id)
-                row['last_funpay_amount'] = current_amount if current_amount is not None else row.get('last_funpay_amount', -1)
-                if current_amount is None or int(current_amount) != int(new_stock):
-                    try:
-                        _set_lot_amount(cardinal, lot_id, new_stock)
-                        row['last_funpay_amount'] = int(new_stock)
-                        changed += 1
-                        notes.append(f'LOT {lot_id}: количество {current_amount if current_amount is not None else "—"} → {new_stock}')
-                        stock_notes.append(f'LOT {lot_id}: FunPay количество → {new_stock}')
-                    except Exception as amount_error:
-                        notes.append(f'LOT {lot_id}: количество не обновлено · {_compact_error(amount_error)}')
-
             price_data = _api_calculate_price(_provider_cfg(cfg, _provider_id(row)), row['product_id'], row['duration_hours'])
             api_cost = _price_total(price_data)
             if api_cost is None:
@@ -4657,15 +5527,8 @@ def _apply_lot_sync(cardinal, owner_key, cfg, products_data=None, balance_data=N
             target_price = _seller_price(api_cost, _effective_markup(cfg, row))
             row['last_funpay_price'] = target_price
             if prev_api_cost > 0 and abs(prev_api_cost - float(api_cost)) >= 0.001:
-                price_notes.append(f'{row["product_name"]}: SteamSMM {prev_api_cost:.2f} → {float(api_cost):.2f} ₽')
-            if cfg.get('auto_price_enabled', True) and row.get('auto_price', True):
-                current = _get_lot_price(cardinal, lot_id)
-                if current is None or abs(float(current) - target_price) >= 0.01:
-                    _set_lot_price(cardinal, lot_id, target_price)
-                    changed += 1
-                    notes.append(f'LOT {lot_id}: цена {current} → {target_price:.2f} ₽')
-                    if prev_funpay > 0 and abs(prev_funpay - target_price) >= 0.01:
-                        price_notes.append(f'LOT {lot_id}: FunPay {prev_funpay:.2f} → {target_price:.2f} ₽')
+                price_notes.append(f'{row["product_name"]}: {PROVIDERS.get(provider, provider)} {prev_api_cost:.2f} → {float(api_cost):.2f} ₽')
+
             reason = ''
             if cfg.get('auto_deactivate_enabled', True):
                 if row.get('auto_stock', True) and product.get('stock_known', True) and product['stock'] <= 0:
@@ -4680,36 +5543,121 @@ def _apply_lot_sync(cardinal, owner_key, cfg, products_data=None, balance_data=N
                 and prev_stock_i == 0
                 and new_stock > 0
             )
-            if reason:
-                need_mark = (not row.get('auto_disabled') or row.get('auto_disabled_reason') != reason)
-                if need_mark:
-                    if _set_lot_active(cardinal, lot_id, False):
-                        row['auto_disabled'] = True
-                        row['auto_disabled_reason'] = reason
-                        changed += 1
-                        human = 'нет аккаунтов в наличии' if reason == 'stock' else 'недостаточно баланса'
-                        lot_notes.append(f'LOT {lot_id} выключен: {human}')
-                        notes.append(f'LOT {lot_id}: выключен ({reason})')
-            elif should_enable:
 
-                actual_active = _get_lot_active(cardinal, lot_id)
-                must_enable = bool(row.get('auto_disabled') or stock_returned or actual_active is False)
-                if must_enable and _set_lot_active(cardinal, lot_id, True):
-                    was_auto_disabled = bool(row.get('auto_disabled'))
-                    row['auto_disabled'] = False
-                    row['auto_disabled_reason'] = ''
-                    changed += 1
-                    if stock_returned or prev_stock_i == 0 or was_auto_disabled:
-                        lot_notes.append(f'LOT {lot_id} снова включён: товар появился')
-                        notes.append(f'LOT {lot_id}: снова включён после появления товара')
+            lf = _get_lot_fields_ready(account, lot_id) if account is not None else None
+            if lf is not None:
+                dirty = False
+                lot_changed_amount = None
+                lot_changed_price = None
+                lot_changed_active = None
+                raw_lf = _lot_raw_fields(lf) or {}
+                cur_amount_val = getattr(lf, 'amount', None)
+                if cur_amount_val in (None, ''):
+                    cur_amount_val = raw_lf.get('amount')
+                cur_amount = _as_int(cur_amount_val, -1) if cur_amount_val not in (None, '') else None
+                if cur_amount is not None:
+                    row['last_funpay_amount'] = cur_amount
+                if row.get('auto_stock', True) and product.get('stock_known', True) and new_stock > 0:
+                    if cur_amount is None or int(cur_amount) != int(new_stock):
+                        lf.amount = int(new_stock)
+                        lot_changed_amount = (cur_amount, int(new_stock))
+                        dirty = True
+                cur_price = None
+                for attr in ('price', 'cost', 'price_rub'):
+                    if hasattr(lf, attr):
+                        try:
+                            cur_price = float(getattr(lf, attr))
+                            break
+                        except Exception:
+                            pass
+                if cur_price is None and raw_lf.get('price') not in (None, ''):
+                    cur_price = _as_float(raw_lf.get('price'), 0.0)
+                if cfg.get('auto_price_enabled', True) and row.get('auto_price', True):
+                    if cur_price is None or abs(float(cur_price) - target_price) >= 0.01:
+                        lf.price = target_price
+                        lot_changed_price = (cur_price, target_price)
+                        dirty = True
+                elif cur_price is not None and 0 < cur_price < 1.0:
+                    lf.price = 1.0
+                    dirty = True
+
+                cur_active = getattr(lf, 'active', None)
+                cur_active_b = bool(cur_active) if cur_active is not None else None
+                if reason:
+                    need_mark = (not row.get('auto_disabled') or row.get('auto_disabled_reason') != reason or cur_active_b is True)
+                    if need_mark:
+                        if cur_active_b is not False:
+                            lf.active = False
+                            dirty = True
+                        lot_changed_active = ('off', reason)
+                elif should_enable:
+                    must_enable = bool(row.get('auto_disabled') or stock_returned or cur_active_b is False)
+                    if must_enable:
+                        if cur_active_b is not True:
+                            lf.active = True
+                            dirty = True
+                        lot_changed_active = ('on', 'returned' if (stock_returned or prev_stock_i == 0 or row.get('auto_disabled')) else 'restored')
+
+                save_ok = True
+                if dirty:
+                    save_lot = getattr(account, 'save_lot', None)
+                    if not callable(save_lot) or not _lot_write_allowed(cardinal, lot_id):
+                        save_ok = False
                     else:
-                        lot_notes.append(f'LOT {lot_id} снова включён: товар доступен')
-                        notes.append(f'LOT {lot_id}: восстановлено состояние ВКЛ')
+                        try:
+                            renew = getattr(lf, 'renew_fields', None)
+                            if callable(renew):
+                                renewed = renew()
+                                if renewed is not None:
+                                    lf = renewed
+                            _funpay_safe_save_lot(save_lot, lf)
+                            _cache_lot_fields(lot_id, lf)
+                            time.sleep(0.35)
+                        except Exception as save_err:
+                            save_ok = False
+                            notes.append(f'LOT {lot_id}: не сохранено · {_compact_error(save_err)}')
+                            if _funpay_lot_observe_error(save_err):
+                                break
 
-            if prev_auto_disabled and not row.get('auto_disabled') and not any(f'LOT {lot_id} снова включён' == x for x in lot_notes):
+                if save_ok:
+                    if lot_changed_amount is not None:
+                        old_a, new_a = lot_changed_amount
+                        row['last_funpay_amount'] = new_a
+                        changed += 1
+                        logger.info('LOT %s · количество %s → %s', lot_id, old_a if old_a is not None else '—', new_a)
+                        notes.append(f'LOT {lot_id}: количество {old_a if old_a is not None else "—"} → {new_a}')
+                        stock_notes.append(f'LOT {lot_id}: FunPay количество → {new_a}')
+                    if lot_changed_price is not None:
+                        old_p, new_p = lot_changed_price
+                        changed += 1
+                        logger.info('LOT %s · цена %.2f ₽', lot_id, new_p)
+                        notes.append(f'LOT {lot_id}: цена {old_p} → {new_p:.2f} ₽')
+                        if prev_funpay > 0 and abs(prev_funpay - new_p) >= 0.01:
+                            price_notes.append(f'LOT {lot_id}: FunPay {prev_funpay:.2f} → {new_p:.2f} ₽')
+                    if lot_changed_active is not None:
+                        mode, tag = lot_changed_active
+                        if mode == 'off':
+                            row['auto_disabled'] = True
+                            row['auto_disabled_reason'] = tag
+                            changed += 1
+                            logger.info('LOT %s · ВЫКЛ', lot_id)
+                            human = 'нет аккаунтов в наличии' if tag == 'stock' else 'недостаточно баланса'
+                            lot_notes.append(f'LOT {lot_id} выключен: {human}')
+                            notes.append(f'LOT {lot_id}: выключен ({tag})')
+                        else:
+                            row['auto_disabled'] = False
+                            row['auto_disabled_reason'] = ''
+                            changed += 1
+                            logger.info('LOT %s · ВКЛ', lot_id)
+                            if tag == 'returned':
+                                lot_notes.append(f'LOT {lot_id} снова включён: товар появился')
+                                notes.append(f'LOT {lot_id}: снова включён после появления товара')
+                            else:
+                                lot_notes.append(f'LOT {lot_id} снова включён: товар доступен')
+                                notes.append(f'LOT {lot_id}: восстановлено состояние ВКЛ')
+
+            if prev_auto_disabled and not row.get('auto_disabled') and not any(f'LOT {lot_id} снова включён' in x for x in lot_notes):
                 lot_notes.append(f'LOT {lot_id} снова доступен')
-            elif (not prev_auto_disabled) and row.get('auto_disabled') and prev_reason != row.get('auto_disabled_reason'):
-                pass
             row['updated_ts'] = _now()
         except SteamSMMError as e:
             if e.status in (500, 502, 503, 504) or e.retryable:
@@ -4792,6 +5740,8 @@ def _retry_pending(cardinal):
     now = _now()
     cfg = _owner_cfg()
     for rec in _rental_list(active_only=False):
+        if rec.get('payment_blocked') or str(rec.get('status') or '').lower() == 'refunded':
+            continue
         if rec.get('status') != 'retry' or int(rec.get('next_retry_ts') or 0) > now:
             continue
         lot = None
@@ -4802,7 +5752,7 @@ def _retry_pending(cardinal):
         if not lot:
             continue
         fake_event = None
-        _schedule(f'rent-order:{rec["order_id"]}', _process_rental_order, cardinal, fake_event, lot, cfg, rec['order_id'], rec.get('chat_id'))
+        _schedule(f'rent-order:{rec["order_id"]}', _process_rental_order, cardinal, fake_event, lot, cfg, rec['order_id'], rec.get('delivery_chat_id') or rec.get('chat_id'))
     for ext in _extension_records().values():
         if ext.get('status') == 'retry' and int(ext.get('next_retry_ts') or 0) <= now and ext.get('purchase_order_id'):
             _schedule(
@@ -4813,7 +5763,7 @@ def _retry_pending(cardinal):
 def _retry_pending_credentials(cardinal):
     now = _now()
     for rec in _rental_list(active_only=False):
-        if not rec.get('rental_id') or rec.get('credentials_delivered'):
+        if not rec.get('rental_id') or rec.get('credentials_delivered') or rec.get('payment_blocked'):
             continue
         if str(rec.get('status') or '').lower() not in {'active', 'completed', 'creating'}:
             continue
@@ -6912,7 +7862,7 @@ def _register_callbacks(cardinal):
                 bot.send_message(c.message.chat.id, f'🔐 Логин: <code>{_h(login)}</code>\n🔑 Пароль: <code>{_h(password)}</code>', parse_mode='HTML')
                 bot.answer_callback_query(c.id)
             elif action == 'guard':
-                data = _api_guard(cfg, rec['rental_id'])
+                data = _api_guard(cfg, rec['rental_id'], expected_login=str(rec.get('account_login') or ''))
                 bot.send_message(c.message.chat.id, f'🛡 Guard: <code>{_h(data.get("code") or data.get("guard_code") or "—")}</code>', parse_mode='HTML')
                 bot.answer_callback_query(c.id)
             else:
@@ -7004,24 +7954,35 @@ def _mark_refunded_order(order_id, status):
 def _paid_status_verified(order):
     return _payment_status_name(order) in {'PAID', 'CLOSED', '0', '1'}
 
-def _verified_paid_order(cardinal, oid, expected_buyer=''):
+def _verified_paid_order_status(cardinal, oid, expected_buyer='', *, cache_ttl=0):
     account = getattr(cardinal, 'account', None)
     if account is None or not callable(getattr(account, 'get_order', None)):
-        return None
+        return None, 'no_account'
+    clean_oid = str(oid).lstrip('#')
+    if cache_ttl > 0 and clean_oid:
+        with _VERIFIED_ORDER_CACHE_LOCK:
+            cached = _VERIFIED_ORDER_CACHE.get(clean_oid)
+            if cached and (time.time() - cached[0]) <= float(cache_ttl):
+                full_cached = cached[1]
+                buyer_c = _norm_username(_order_field(full_cached, 'buyer_username'))
+                if not expected_buyer or not buyer_c or buyer_c == _norm_username(expected_buyer):
+                    return full_cached, 'ok'
     try:
-        full = account.get_order(str(oid).lstrip('#'))
+        full = account.get_order(clean_oid)
     except Exception as error:
         logger.warning('Заказ #%s · проверка оплаты через FunPay не удалась: %s', oid, _compact_error(error))
-        return None
-    if full is None or str(_order_field(full, 'id') or '').lstrip('#') != str(oid).lstrip('#'):
+        return None, 'network_error'
+    if full is None or str(_order_field(full, 'id') or '').lstrip('#') != clean_oid:
         logger.warning('Заказ #%s · FunPay не подтвердил идентификатор заказа.', oid)
-        return None
+        return None, 'not_found'
     if not _paid_status_verified(full):
         status = _payment_status_name(full)
         _mark_refunded_order(oid, status)
+        with _VERIFIED_ORDER_CACHE_LOCK:
+            _VERIFIED_ORDER_CACHE.pop(clean_oid, None)
         _payment_log_once(oid, status, 'Заказ #%s · автовыдача заблокирована: статус FunPay %s.',
                           level='warning' if status in _PAYMENT_TERMINAL_STATUSES else 'info')
-        return None
+        return None, ('terminal' if status in _PAYMENT_TERMINAL_STATUSES else 'not_paid')
     seller_id = _order_field(full, 'seller_id')
     our_id = _order_field(account, 'id')
     seller_name = _norm_username(_order_field(full, 'seller_username'))
@@ -7030,57 +7991,101 @@ def _verified_paid_order(cardinal, oid, expected_buyer=''):
              and str(seller_id) == str(our_id)) or
             (seller_name and our_name and seller_name == our_name)):
         logger.warning('Заказ #%s · продавец не совпадает с аккаунтом Cardinal.', oid)
-        return None
+        return None, 'seller_mismatch'
     buyer = _norm_username(_order_field(full, 'buyer_username'))
     if expected_buyer and buyer and buyer != _norm_username(expected_buyer):
         logger.warning('Заказ #%s · покупатель не совпадает с данными события.', oid)
-        return None
+        return None, 'buyer_mismatch'
+    with _VERIFIED_ORDER_CACHE_LOCK:
+        _VERIFIED_ORDER_CACHE[clean_oid] = (time.time(), full)
+        if len(_VERIFIED_ORDER_CACHE) > 2000:
+            cutoff = time.time() - 600
+            for k, v in list(_VERIFIED_ORDER_CACHE.items()):
+                if v[0] < cutoff:
+                    _VERIFIED_ORDER_CACHE.pop(k, None)
+    return full, 'ok'
+
+def _verified_paid_order(cardinal, oid, expected_buyer=''):
+    full, _reason = _verified_paid_order_status(cardinal, oid, expected_buyer=expected_buyer, cache_ttl=0)
     return full
 
-def _paid_rental_access(cardinal, rec, chat_id=None, author=''):
-    full = _verified_paid_order(cardinal, str((rec or {}).get('order_id') or ''),
-                                expected_buyer=(rec or {}).get('buyer_username') or '')
+def _order_matches_event_chat(cardinal, order, chat_id, *, author='', author_id=None, chat_name='', record=None):
+    if chat_id in (None, ''):
+        return True
+    chat_s = str(chat_id).strip()
+    if record and chat_s in _record_chat_aliases(record):
+        return True
+    order_chat = _order_field(order, 'chat_id')
+    if order_chat not in (None, '', 0) and chat_s == str(order_chat).strip():
+        return True
+    account = getattr(cardinal, 'account', None) if cardinal is not None else None
+    our_id = str(_order_field(account, 'id') or '').strip()
+    order_buyer_id = str(_order_field(order, 'buyer_id') or (record or {}).get('buyer_id') or '').strip()
+    aid = str(author_id or '').strip()
+    if aid and aid != '0':
+        if order_buyer_id and aid == order_buyer_id:
+            return True
+        pair = _users_node_pair(order_chat)
+        if pair and our_id and {our_id, aid} == pair:
+            return True
+    raw_buyer = str(_order_field(order, 'buyer_username') or (record or {}).get('buyer_username') or '').strip()
+    norm_buyer = _norm_username(raw_buyer)
+    norm_author = _norm_username(author)
+    norm_cname = _norm_username(chat_name)
+    if norm_buyer and norm_author and norm_author == norm_buyer and (not norm_cname or norm_cname == norm_buyer):
+        return True
+    if norm_buyer and norm_cname and norm_cname == norm_buyer and (not norm_author or norm_author in {'funpay', 'system', 'система'} or aid == '0'):
+        return True
+    if raw_buyer and cardinal is not None:
+        resolved = _find_chat_by_buyer_name(cardinal, raw_buyer, allow_network=True)
+        if resolved and str(_order_field(resolved, 'id') or '').strip() == chat_s:
+            return True
+    return False
+
+def _paid_rental_access(cardinal, rec, chat_id=None, author='', author_id=None, chat_name=''):
+    if not rec:
+        return False
+    if rec.get('payment_blocked') or str(rec.get('status') or '').lower() == 'refunded':
+        return False
+    oid = str(rec.get('order_id') or '')
+    full, reason = _verified_paid_order_status(
+        cardinal, oid, expected_buyer=rec.get('buyer_username') or '', cache_ttl=60
+    )
     if full is None:
+        if reason == 'network_error' and rec.get('lot_paid_verified') and rec.get('rental_id') and not rec.get('payment_blocked'):
+            if chat_id is None or _record_belongs_to_buyer(rec, chat_id, author, author_id=author_id, chat_name=chat_name):
+                logger.warning('Заказ #%s · FunPay временно недоступен, доступ разрешён по подтверждённой записи аренды.', oid)
+                return True
         return False
     if chat_id is None:
         return True
-    chat_id = str(chat_id)
-    paid_chat = _paid_order_chat(cardinal, full)
-    if paid_chat not in (None, '') and chat_id == str(paid_chat):
+    if _order_matches_event_chat(cardinal, full, chat_id, author=author, author_id=author_id, chat_name=chat_name, record=rec):
+        _remember_rental_contact(
+            oid, chat_id,
+            _order_field(full, 'buyer_username') or author,
+            _order_field(full, 'buyer_id') or author_id
+        )
         return True
-    buyer = _norm_username(_order_field(full, 'buyer_username'))
-    if not buyer or buyer != _norm_username(author):
-        logger.info('Заказ #%s · доступ отклонён: чат %s не совпал с оплаченным чатом.',
-                    (rec or {}).get('order_id'), chat_id)
-        return False
-
-
-    if chat_id in _record_chat_aliases(rec or {}):
-        return True
-    finder = getattr(getattr(cardinal, 'account', None), 'get_chat_by_name', None)
-    if callable(finder):
-        try:
-            buyer_chat = finder(buyer, True)
-            if str(_order_field(buyer_chat, 'id') or '') == chat_id:
-                return True
-        except Exception:
-            pass
-    logger.info('Заказ #%s · доступ отклонён: не удалось подтвердить новый чат покупателя.',
-                (rec or {}).get('order_id'))
+    logger.info('Заказ #%s · доступ отклонён: чат %s не совпал с покупателем заказа.', oid, chat_id)
     return False
 
-def _paid_order_chat(cardinal, order):
-    chat_id = _order_field(order, 'chat_id')
-    if chat_id not in (None, '', 0):
-        return chat_id
-    buyer = _order_field(order, 'buyer_username')
-    finder = getattr(getattr(cardinal, 'account', None), 'get_chat_by_name', None)
-    if buyer and callable(finder):
-        try:
-            chat = finder(buyer, True)
-            return _order_field(chat, 'id')
-        except Exception:
-            pass
+def _paid_order_chat(cardinal, order, preferred_chat_id=None):
+    order_chat = _order_field(order, 'chat_id')
+    raw_buyer = str(_order_field(order, 'buyer_username') or '').strip()
+    if _is_numeric_chat_id(order_chat):
+        return order_chat
+    if raw_buyer and cardinal is not None:
+        resolved = _find_chat_by_buyer_name(cardinal, raw_buyer, allow_network=False)
+        if resolved and getattr(resolved, 'id', None) not in (None, ''):
+            return resolved.id
+    if _is_numeric_chat_id(preferred_chat_id):
+        return preferred_chat_id
+    if order_chat not in (None, '', 0):
+        return order_chat
+    if raw_buyer and cardinal is not None:
+        resolved = _find_chat_by_buyer_name(cardinal, raw_buyer, allow_network=True)
+        if resolved and getattr(resolved, 'id', None) not in (None, ''):
+            return resolved.id
     return None
 
 def _system_purchase_message(event):
@@ -7109,13 +8114,27 @@ def _dispatch_paid_order(cardinal, event, order, oid, chat_id=None, source='even
                           'Заказ #%s · пропущен: нет подтверждённого оплаченного заказа FunPay (%s).',
                           level='info')
         return False
-    target_chat = _paid_order_chat(cardinal, full_order)
+    event_chat_name = _event_chat_name(event) if event is not None else ''
+    if source == 'paid_message' and chat_id not in (None, ''):
+        if not _order_matches_event_chat(cardinal, full_order, chat_id, author='FunPay', author_id=0, chat_name=event_chat_name):
+            logger.warning('Заказ #%s · входное системное сообщение из чужого чата пропущено.', oid)
+            return False
+    target_chat = _paid_order_chat(
+        cardinal, full_order,
+        preferred_chat_id=chat_id if source == 'paid_message' else None
+    )
     if not target_chat:
         logger.warning('Заказ #%s · не удалось установить чат покупателя из оплаченного заказа.', oid)
         return False
-    if source == 'paid_message' and chat_id not in (None, '') and str(chat_id) != str(target_chat):
-        logger.warning('Заказ #%s · входное системное сообщение из чужого чата пропущено.', oid)
-        return False
+    buyer_username = str(_order_field(full_order, 'buyer_username') or '').strip()
+    buyer_id = str(_order_field(full_order, 'buyer_id') or '').strip()
+    # Immediately bind numeric chat_id from paid_message to existing rental record if present
+    existing = _rental_get(oid)
+    if existing:
+        if chat_id not in (None, ''):
+            _remember_rental_contact(oid, chat_id, buyer_username, buyer_id)
+        if target_chat not in (None, ''):
+            _remember_rental_contact(oid, target_chat, buyer_username, buyer_id)
 
     authoritative_ids = set(_order_lot_ids(full_order)) | _candidate_ids_from_html(full_order)
     authoritative_text = ' | '.join(_order_text_candidates(full_order))
@@ -7150,10 +8169,11 @@ def _dispatch_paid_order(cardinal, event, order, oid, chat_id=None, source='even
         logger.info('Заказ #%s · настроенный Rental LOT не подтверждён из заказа FunPay · ids=%s · text=%s',
                     oid, sorted(authoritative_ids), _compact_error(authoritative_text, 180))
         return False
-    buyer_username = str(_order_field(full_order, 'buyer_username') or '').strip()
     existing = _rental_get(oid)
     if existing and existing.get('rental_id'):
-        _remember_rental_contact(oid, target_chat, buyer_username)
+        _remember_rental_contact(oid, target_chat, buyer_username, buyer_id)
+        if chat_id not in (None, ''):
+            _remember_rental_contact(oid, chat_id, buyer_username, buyer_id)
         if existing.get('status') in {'active', 'completed'} and not existing.get('credentials_delivered'):
             _schedule(f'credentials:{oid}', _credentials_delivery_worker, cardinal, oid)
         return True
@@ -7181,34 +8201,39 @@ def _paid_rental_lot_match(cardinal, order, lot, trusted_purchase_text=''):
     trusted_text = _normalize_order_text(trusted_purchase_text)
     texts = ' | '.join(_normalize_order_text(x) for x in _order_text_candidates(order))
     combined = (texts + ' ' + trusted_text).strip()
-    if not product or len(product) < 3 or product not in combined:
+    product_in_text = bool(product and len(product) >= 3 and product in combined)
+    summary_in_text = False
+    if not product_in_text and cardinal is not None:
+        for summary in _funpay_lot_summaries(cardinal, lot_id, allow_fetch=True):
+            norm_sum = _normalize_order_text(summary)
+            if norm_sum and len(norm_sum) >= 6 and norm_sum in combined:
+                summary_in_text = True
+                break
+    if not product_in_text and not summary_in_text:
         return False
     prices = _order_price_candidates(order)
-    actual = _get_lot_price(cardinal, lot_id) if cardinal is not None else None
-    if not actual or actual <= 0:
-        actual = _as_float(lot.get('last_funpay_price'), 0.0)
+    actual = _cached_or_saved_lot_price(cardinal, lot, allow_fetch=True)
     if actual and any(abs(float(actual) - p) <= 0.02 for p in prices):
         return True
     if not trusted_text:
         return False
-    if _has_unmanaged_product_collision(cardinal, lot, product):
+    if product_in_text and _has_unmanaged_product_collision(cardinal, lot, product):
         return False
-
-
 
     offer_texts = _funpay_lot_text(cardinal, lot_id) if cardinal is not None else []
     titles = [_normalize_order_text(x) for x in offer_texts]
-    titles = [x for x in titles if len(x) >= 15 and x != product and x in trusted_text]
+    min_len = 6 if summary_in_text else 15
+    titles = [x for x in titles if len(x) >= min_len and x != product and x in trusted_text]
     if not titles:
         return False
     owner_cfg = _owner_cfg()
     for other in (owner_cfg.get('lots') or []):
         if _as_int(other.get('lot_id'), 0) == lot_id:
             continue
-        if _normalize_order_text(other.get('product_name')) != product:
+        if product_in_text and _normalize_order_text(other.get('product_name')) != product:
             continue
-        if any(_normalize_order_text(x) in trusted_text and len(_normalize_order_text(x)) >= 15
-               for x in _funpay_lot_text(cardinal, int(other['lot_id']))):
+        if any(_normalize_order_text(x) in trusted_text and len(_normalize_order_text(x)) >= min_len
+               for x in _funpay_lot_text(cardinal, int(other['lot_id']), allow_fetch=False)):
             return False
     logger.info('LOT %s подтверждён по точному названию из системной покупки (цена могла измениться).', lot_id)
     return True
@@ -7222,6 +8247,34 @@ def _paid_extension_match(order, ext):
         return False
     marker = str((ext or {}).get('marker') or '').casefold().strip()
     return bool(marker and any(marker in text.casefold() for text in _order_text_candidates(order)))
+
+def _seen_message_add(key):
+    with _SEEN_MESSAGES_LOCK:
+        if key in _SEEN_MESSAGES:
+            return False
+        _SEEN_MESSAGES[key] = time.time()
+        if len(_SEEN_MESSAGES) > 4000:
+            for k in list(_SEEN_MESSAGES.keys())[:1000]:
+                _SEEN_MESSAGES.pop(k, None)
+        return True
+
+def _cmd_executor():
+    global _CMD_EXECUTOR
+    with _CMD_EXECUTOR_LOCK:
+        if _CMD_EXECUTOR is None:
+            _CMD_EXECUTOR = ThreadPoolExecutor(max_workers=6, thread_name_prefix='AUTO-RENTAL-CMD')
+        return _CMD_EXECUTOR
+
+def _submit_buyer_command(cardinal, event):
+    def _run():
+        try:
+            _buyer_command_handler(cardinal, event)
+        except Exception as exc:
+            logger.exception('buyer_command_handler error: %s', exc)
+    try:
+        _cmd_executor().submit(_run)
+    except Exception as exc:
+        logger.exception('buyer_command submit error: %s', exc)
 
 def new_order_handler(cardinal, event):
     try:
@@ -7240,6 +8293,14 @@ def new_order_handler(cardinal, event):
 
 def new_message_handler(cardinal, event):
     try:
+        if getattr(cardinal, 'old_mode_enabled', False):
+            return
+        msg = _order_field(event, 'message')
+        if getattr(msg, 'by_bot', False) or getattr(msg, 'by_vertex', False):
+            return
+        msg_id = _message_id_from_obj(msg)
+        if msg_id is not None and not _seen_message_add(('m', str(msg_id))):
+            return
         text = _event_text(event)
         match = _PAID_ORDER_RE.search(text) if _system_purchase_message(event) else None
         if match:
@@ -7251,11 +8312,34 @@ def new_message_handler(cardinal, event):
         if not cfg.get('plugin_enabled', True) or not _has_provider_keys(cfg):
             return
         _review_message_handler(cardinal, event)
-        _buyer_command_handler(cardinal, event)
+        if _is_buyer_message(cardinal, event) and text:
+            _submit_buyer_command(cardinal, event)
     except Exception as e:
         logger.exception('new_message_handler error: %s', e)
+
+def last_chat_message_changed_handler(cardinal, event):
+    try:
+        if not getattr(cardinal, 'old_mode_enabled', False):
+            return
+        chat = _order_field(event, 'chat')
+        if chat is None or not getattr(chat, 'unread', False) or getattr(chat, 'last_by_bot', False):
+            return
+        text = _event_text(event)
+        if not text:
+            return
+        dedup_key = ('c', str(getattr(chat, 'id', '')), str(getattr(chat, 'node_msg_id', '')), text[:60])
+        if not _seen_message_add(dedup_key):
+            return
+        cfg = _owner_cfg(_event_chat_id(event))
+        if not cfg.get('plugin_enabled', True) or not _has_provider_keys(cfg):
+            return
+        if _is_buyer_message(cardinal, event):
+            _submit_buyer_command(cardinal, event)
+    except Exception as e:
+        logger.exception('last_chat_message_changed_handler error: %s', e)
 
 BIND_TO_PRE_INIT = [init_cardinal]
 BIND_TO_NEW_ORDER = [new_order_handler]
 BIND_TO_NEW_MESSAGE = [new_message_handler]
+BIND_TO_LAST_CHAT_MESSAGE_CHANGED = [last_chat_message_changed_handler]
 BIND_TO_DELETE = None
